@@ -9,17 +9,16 @@
  *   5. Restricted run NEVER reads the seed even when the flag is enabled
  */
 
-import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, it, before, after, beforeEach } from "node:test";
+import { afterEach, describe, expect, it } from "vitest";
 import {
-  isPluginSeedEnabled,
-  resolvePluginSeedDir,
-  readPluginsSha,
-  publishPluginSeed,
   applyPluginSeed,
+  isPluginSeedEnabled,
+  publishPluginSeed,
+  readPluginsSha,
+  resolvePluginSeedDir,
 } from "./codex-plugin-seed.js";
 
 // ── Test fixtures ──────────────────────────────────────────────────────────
@@ -31,297 +30,274 @@ const FAKE_ENV_BASE: NodeJS.ProcessEnv = {
   PAPERCLIP_INSTANCE_ID: "default",
 };
 
+const tmpDirs: string[] = [];
+
 async function makeTmpDir(prefix = "codex-seed-test-"): Promise<string> {
-  return fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  const d = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  tmpDirs.push(d);
+  return d;
 }
 
-async function makeSourcePluginsDir(dir: string, sha = FAKE_SHA): Promise<string> {
-  const pluginsDir = path.join(dir, "plugins");
+async function chmodWritable(dir: string): Promise<void> {
+  try {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        await chmodWritable(p);
+      }
+      await fs.chmod(p, 0o755).catch(() => {});
+    }
+    await fs.chmod(dir, 0o755).catch(() => {});
+  } catch {
+    // best-effort
+  }
+}
+
+afterEach(async () => {
+  for (const d of tmpDirs.splice(0)) {
+    // Restore write permissions so rm can recurse into read-only seed dirs.
+    await chmodWritable(d);
+    await fs.rm(d, { recursive: true, force: true });
+  }
+});
+
+async function makeSourcePluginsDir(parent: string): Promise<string> {
+  const pluginsDir = path.join(parent, "plugins");
   await fs.mkdir(pluginsDir, { recursive: true });
-  // A sentinel plugin file to verify copy.
   await fs.writeFile(path.join(pluginsDir, "README.md"), "fake plugins tree");
   await fs.writeFile(path.join(pluginsDir, "plugin-a.js"), "module.exports = {};");
-  // Write sha file in parent.
-  await fs.writeFile(path.join(dir, "plugins.sha"), sha + "\n");
+  await fs.writeFile(path.join(parent, "plugins.sha"), FAKE_SHA + "\n");
   return pluginsDir;
 }
 
-async function makeCodexHome(dir: string): Promise<string> {
-  const home = path.join(dir, "codex-home");
+async function makeCodexHome(parent: string): Promise<string> {
+  const home = path.join(parent, "codex-home");
   await fs.mkdir(home, { recursive: true });
   return home;
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────
+// ── isPluginSeedEnabled ────────────────────────────────────────────────────
 
 describe("isPluginSeedEnabled", () => {
   it("is off by default", () => {
-    assert.equal(isPluginSeedEnabled({}), false);
+    expect(isPluginSeedEnabled({})).toBe(false);
   });
 
   it("is on when CODEX_SHARED_PLUGIN_SEED_ENABLED=1", () => {
-    assert.equal(isPluginSeedEnabled({ CODEX_SHARED_PLUGIN_SEED_ENABLED: "1" }), true);
+    expect(isPluginSeedEnabled({ CODEX_SHARED_PLUGIN_SEED_ENABLED: "1" })).toBe(true);
   });
 
   it("is on when CODEX_SHARED_PLUGIN_SEED_ENABLED=true", () => {
-    assert.equal(isPluginSeedEnabled({ CODEX_SHARED_PLUGIN_SEED_ENABLED: "true" }), true);
+    expect(isPluginSeedEnabled({ CODEX_SHARED_PLUGIN_SEED_ENABLED: "true" })).toBe(true);
   });
 
   it("is off for any other value", () => {
-    assert.equal(isPluginSeedEnabled({ CODEX_SHARED_PLUGIN_SEED_ENABLED: "0" }), false);
-    assert.equal(isPluginSeedEnabled({ CODEX_SHARED_PLUGIN_SEED_ENABLED: "false" }), false);
-    assert.equal(isPluginSeedEnabled({ CODEX_SHARED_PLUGIN_SEED_ENABLED: "" }), false);
+    expect(isPluginSeedEnabled({ CODEX_SHARED_PLUGIN_SEED_ENABLED: "0" })).toBe(false);
+    expect(isPluginSeedEnabled({ CODEX_SHARED_PLUGIN_SEED_ENABLED: "false" })).toBe(false);
+    expect(isPluginSeedEnabled({ CODEX_SHARED_PLUGIN_SEED_ENABLED: "" })).toBe(false);
   });
 });
+
+// ── resolvePluginSeedDir ───────────────────────────────────────────────────
 
 describe("resolvePluginSeedDir", () => {
   it("produces company-scoped, policy-scoped, SHA-versioned path", async () => {
     const tmp = await makeTmpDir();
-    try {
-      const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
-      const seedDir = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
-      assert.ok(seedDir.includes("companies"));
-      assert.ok(seedDir.includes(FAKE_COMPANY_ID));
-      assert.ok(seedDir.includes("codex-plugin-seed"));
-      assert.ok(seedDir.includes("unrestricted"));
-      assert.ok(seedDir.includes("v1"));
-      assert.ok(seedDir.includes(FAKE_SHA));
-    } finally {
-      await fs.rm(tmp, { recursive: true, force: true });
-    }
+    const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
+    const seedDir = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
+    expect(seedDir).toContain("companies");
+    expect(seedDir).toContain(FAKE_COMPANY_ID);
+    expect(seedDir).toContain("codex-plugin-seed");
+    expect(seedDir).toContain("unrestricted");
+    expect(seedDir).toContain("v1");
+    expect(seedDir).toContain(FAKE_SHA);
   });
 
   it("different SHAs produce different paths", async () => {
     const tmp = await makeTmpDir();
-    try {
-      const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
-      const sha2 = "b".repeat(40);
-      const d1 = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
-      const d2 = resolvePluginSeedDir(env, FAKE_COMPANY_ID, sha2);
-      assert.notEqual(d1, d2);
-    } finally {
-      await fs.rm(tmp, { recursive: true, force: true });
-    }
+    const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
+    const sha2 = "b".repeat(40);
+    const d1 = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
+    const d2 = resolvePluginSeedDir(env, FAKE_COMPANY_ID, sha2);
+    expect(d1).not.toBe(d2);
   });
 
   it("different companies produce different paths", async () => {
     const tmp = await makeTmpDir();
-    try {
-      const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
-      const d1 = resolvePluginSeedDir(env, "company-a", FAKE_SHA);
-      const d2 = resolvePluginSeedDir(env, "company-b", FAKE_SHA);
-      assert.notEqual(d1, d2);
-    } finally {
-      await fs.rm(tmp, { recursive: true, force: true });
-    }
+    const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
+    const d1 = resolvePluginSeedDir(env, "company-a", FAKE_SHA);
+    const d2 = resolvePluginSeedDir(env, "company-b", FAKE_SHA);
+    expect(d1).not.toBe(d2);
   });
 });
 
+// ── publishPluginSeed ──────────────────────────────────────────────────────
+
 describe("publishPluginSeed", () => {
-  it("publishes seed and marks it read-only", async () => {
+  it("publishes seed, writes sentinel, and marks it read-only", async () => {
     const tmp = await makeTmpDir();
-    try {
-      const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
-      const sourceDir = path.join(tmp, ".tmp");
-      await fs.mkdir(sourceDir, { recursive: true });
-      const sourcePluginsDir = await makeSourcePluginsDir(sourceDir);
-      const seedDir = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
+    const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
+    const sourceDir = path.join(tmp, ".tmp");
+    await fs.mkdir(sourceDir, { recursive: true });
+    const sourcePluginsDir = await makeSourcePluginsDir(sourceDir);
+    const seedDir = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
 
-      const result = await publishPluginSeed({
-        sourcePluginsDir,
-        seedDir,
-        pluginsSha: FAKE_SHA,
-        companyId: FAKE_COMPANY_ID,
-        env,
-      });
+    const result = await publishPluginSeed({
+      sourcePluginsDir,
+      seedDir,
+      pluginsSha: FAKE_SHA,
+      companyId: FAKE_COMPANY_ID,
+      env,
+    });
 
-      assert.equal(result, "published");
-      // Sentinel file must exist.
-      const sentinelPath = path.join(seedDir, ".paperclip-plugin-seed");
-      const sentinel = JSON.parse(await fs.readFile(sentinelPath, "utf8"));
-      assert.equal(sentinel.pluginsSha, FAKE_SHA);
-      assert.equal(sentinel.companyId, FAKE_COMPANY_ID);
-      assert.equal(sentinel.schemaVersion, 1);
-      // Seed dir must be read-only.
-      const stat = await fs.stat(seedDir);
-      assert.ok(!(stat.mode & 0o222), "seed directory must not be writable");
-    } finally {
-      await fs.rm(tmp, { recursive: true, force: true });
-    }
+    expect(result).toBe("published");
+
+    const sentinel = JSON.parse(
+      await fs.readFile(path.join(seedDir, ".paperclip-plugin-seed"), "utf8"),
+    );
+    expect(sentinel.pluginsSha).toBe(FAKE_SHA);
+    expect(sentinel.companyId).toBe(FAKE_COMPANY_ID);
+    expect(sentinel.schemaVersion).toBe(1);
+
+    const stat = await fs.stat(seedDir);
+    expect(stat.mode & 0o222).toBe(0); // not writable
   });
 
   it("is idempotent — returns already_exists on second call", async () => {
     const tmp = await makeTmpDir();
-    try {
-      const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
-      const sourceDir = path.join(tmp, ".tmp");
-      await fs.mkdir(sourceDir, { recursive: true });
-      const sourcePluginsDir = await makeSourcePluginsDir(sourceDir);
-      const seedDir = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
+    const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
+    const sourceDir = path.join(tmp, ".tmp");
+    await fs.mkdir(sourceDir, { recursive: true });
+    const sourcePluginsDir = await makeSourcePluginsDir(sourceDir);
+    const seedDir = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
 
-      await publishPluginSeed({ sourcePluginsDir, seedDir, pluginsSha: FAKE_SHA, companyId: FAKE_COMPANY_ID, env });
-      const r2 = await publishPluginSeed({ sourcePluginsDir, seedDir, pluginsSha: FAKE_SHA, companyId: FAKE_COMPANY_ID, env });
-      assert.equal(r2, "already_exists");
-    } finally {
-      await fs.rm(tmp, { recursive: true, force: true });
-    }
+    await publishPluginSeed({ sourcePluginsDir, seedDir, pluginsSha: FAKE_SHA, companyId: FAKE_COMPANY_ID, env });
+    const r2 = await publishPluginSeed({ sourcePluginsDir, seedDir, pluginsSha: FAKE_SHA, companyId: FAKE_COMPANY_ID, env });
+    expect(r2).toBe("already_exists");
   });
 
   it("returns skipped_source_missing when source absent", async () => {
     const tmp = await makeTmpDir();
-    try {
-      const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
-      const seedDir = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
-      const result = await publishPluginSeed({
-        sourcePluginsDir: path.join(tmp, "nonexistent"),
-        seedDir,
-        pluginsSha: FAKE_SHA,
-        companyId: FAKE_COMPANY_ID,
-        env,
-      });
-      assert.equal(result, "skipped_source_missing");
-    } finally {
-      await fs.rm(tmp, { recursive: true, force: true });
-    }
+    const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
+    const seedDir = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
+    const result = await publishPluginSeed({
+      sourcePluginsDir: path.join(tmp, "nonexistent"),
+      seedDir,
+      pluginsSha: FAKE_SHA,
+      companyId: FAKE_COMPANY_ID,
+      env,
+    });
+    expect(result).toBe("skipped_source_missing");
   });
 });
 
+// ── applyPluginSeed ────────────────────────────────────────────────────────
+
 describe("applyPluginSeed", () => {
-  it("applies seed to unrestricted run — correct SHA", async () => {
+  it("UNRESTRICTED run — applies seed, copies files, writes sha file", async () => {
     const tmp = await makeTmpDir();
-    try {
-      const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
-      // Build and publish a seed.
-      const sourceDir = path.join(tmp, ".tmp");
-      await fs.mkdir(sourceDir, { recursive: true });
-      const sourcePluginsDir = await makeSourcePluginsDir(sourceDir);
-      const seedDir = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
-      await publishPluginSeed({ sourcePluginsDir, seedDir, pluginsSha: FAKE_SHA, companyId: FAKE_COMPANY_ID, env });
+    const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
+    const sourceDir = path.join(tmp, ".tmp");
+    await fs.mkdir(sourceDir, { recursive: true });
+    const sourcePluginsDir = await makeSourcePluginsDir(sourceDir);
+    const seedDir = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
+    await publishPluginSeed({ sourcePluginsDir, seedDir, pluginsSha: FAKE_SHA, companyId: FAKE_COMPANY_ID, env });
 
-      // Apply to a fresh codex home.
-      const codexHome = await makeCodexHome(tmp);
-      const result = await applyPluginSeed({ codexHome, seedDir, pluginsSha: FAKE_SHA, isRestricted: false });
-      assert.equal(result, "applied");
+    const codexHome = await makeCodexHome(tmp);
+    const result = await applyPluginSeed({ codexHome, seedDir, pluginsSha: FAKE_SHA, isRestricted: false });
+    expect(result).toBe("applied");
 
-      // Plugins must be present in run home.
-      const pluginsDir = path.join(codexHome, ".tmp", "plugins");
-      const readmeExists = await fs.access(path.join(pluginsDir, "README.md")).then(() => true).catch(() => false);
-      assert.ok(readmeExists, "README.md should be copied from seed");
+    // Plugin files must be in run home.
+    const readmeExists = await fs.access(path.join(codexHome, ".tmp", "plugins", "README.md")).then(() => true).catch(() => false);
+    expect(readmeExists).toBe(true);
 
-      // plugins.sha must be written.
-      const writtenSha = (await fs.readFile(path.join(codexHome, ".tmp", "plugins.sha"), "utf8")).trim();
-      assert.equal(writtenSha, FAKE_SHA);
+    // plugins.sha must be written.
+    const writtenSha = (await fs.readFile(path.join(codexHome, ".tmp", "plugins.sha"), "utf8")).trim();
+    expect(writtenSha).toBe(FAKE_SHA);
 
-      // Sentinel file must NOT be in the run home.
-      const sentinelInHome = await fs.access(path.join(pluginsDir, ".paperclip-plugin-seed")).then(() => true).catch(() => false);
-      assert.ok(!sentinelInHome, "sentinel file must not be copied to run home");
-    } finally {
-      await fs.rm(tmp, { recursive: true, force: true });
-    }
+    // Sentinel file must NOT appear in the run home.
+    const sentinelInHome = await fs.access(path.join(codexHome, ".tmp", "plugins", ".paperclip-plugin-seed")).then(() => true).catch(() => false);
+    expect(sentinelInHome).toBe(false);
   });
 
   it("RESTRICTED run — never reads seed even when flag enabled", async () => {
     const tmp = await makeTmpDir();
-    try {
-      const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
-      const sourceDir = path.join(tmp, ".tmp");
-      await fs.mkdir(sourceDir, { recursive: true });
-      const sourcePluginsDir = await makeSourcePluginsDir(sourceDir);
-      const seedDir = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
-      await publishPluginSeed({ sourcePluginsDir, seedDir, pluginsSha: FAKE_SHA, companyId: FAKE_COMPANY_ID, env });
+    const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
+    const sourceDir = path.join(tmp, ".tmp");
+    await fs.mkdir(sourceDir, { recursive: true });
+    const sourcePluginsDir = await makeSourcePluginsDir(sourceDir);
+    const seedDir = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
+    await publishPluginSeed({ sourcePluginsDir, seedDir, pluginsSha: FAKE_SHA, companyId: FAKE_COMPANY_ID, env });
 
-      const codexHome = await makeCodexHome(tmp);
-      // isRestricted=true — must never apply
-      const result = await applyPluginSeed({ codexHome, seedDir, pluginsSha: FAKE_SHA, isRestricted: true });
-      assert.equal(result, "skipped");
+    const codexHome = await makeCodexHome(tmp);
+    const result = await applyPluginSeed({ codexHome, seedDir, pluginsSha: FAKE_SHA, isRestricted: true });
+    expect(result).toBe("skipped");
 
-      // Plugins directory must NOT exist in restricted run home.
-      const pluginsDir = path.join(codexHome, ".tmp", "plugins");
-      const pluginsExist = await fs.access(pluginsDir).then(() => true).catch(() => false);
-      assert.ok(!pluginsExist, "Restricted run must not have seed plugins in CODEX_HOME");
+    // Plugins directory MUST NOT exist in restricted run home.
+    const pluginsExist = await fs.access(path.join(codexHome, ".tmp", "plugins")).then(() => true).catch(() => false);
+    expect(pluginsExist).toBe(false);
 
-      // No seed paths, symlinks, or files from seed in the restricted run home's .tmp.
-      const tmpEntries = await fs.readdir(path.join(codexHome, ".tmp")).catch(() => []);
-      assert.equal(tmpEntries.length, 0, "Restricted run home .tmp must be empty");
-    } finally {
-      await fs.rm(tmp, { recursive: true, force: true });
-    }
+    // .tmp must be empty — no seed paths, no sha, no sentinel.
+    const tmpEntries = await fs.readdir(path.join(codexHome, ".tmp")).catch(() => []);
+    expect(tmpEntries.length).toBe(0);
   });
 
   it("returns skipped when SHA mismatch — rejects stale or tampered seed", async () => {
     const tmp = await makeTmpDir();
-    try {
-      const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
-      const sourceDir = path.join(tmp, ".tmp");
-      await fs.mkdir(sourceDir, { recursive: true });
-      const sourcePluginsDir = await makeSourcePluginsDir(sourceDir);
-      const seedDir = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
-      await publishPluginSeed({ sourcePluginsDir, seedDir, pluginsSha: FAKE_SHA, companyId: FAKE_COMPANY_ID, env });
+    const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
+    const sourceDir = path.join(tmp, ".tmp");
+    await fs.mkdir(sourceDir, { recursive: true });
+    const sourcePluginsDir = await makeSourcePluginsDir(sourceDir);
+    const seedDir = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
+    await publishPluginSeed({ sourcePluginsDir, seedDir, pluginsSha: FAKE_SHA, companyId: FAKE_COMPANY_ID, env });
 
-      const codexHome = await makeCodexHome(tmp);
-      const wrongSha = "c".repeat(40);
-      const result = await applyPluginSeed({ codexHome, seedDir, pluginsSha: wrongSha, isRestricted: false });
-      assert.equal(result, "skipped");
-    } finally {
-      await fs.rm(tmp, { recursive: true, force: true });
-    }
+    const codexHome = await makeCodexHome(tmp);
+    const wrongSha = "c".repeat(40);
+    const result = await applyPluginSeed({ codexHome, seedDir, pluginsSha: wrongSha, isRestricted: false });
+    expect(result).toBe("skipped");
   });
 
   it("returns already_present when codexHome already has plugins", async () => {
     const tmp = await makeTmpDir();
-    try {
-      const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
-      const sourceDir = path.join(tmp, ".tmp");
-      await fs.mkdir(sourceDir, { recursive: true });
-      const sourcePluginsDir = await makeSourcePluginsDir(sourceDir);
-      const seedDir = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
-      await publishPluginSeed({ sourcePluginsDir, seedDir, pluginsSha: FAKE_SHA, companyId: FAKE_COMPANY_ID, env });
+    const env: NodeJS.ProcessEnv = { ...FAKE_ENV_BASE, PAPERCLIP_HOME: tmp };
+    const sourceDir = path.join(tmp, ".tmp");
+    await fs.mkdir(sourceDir, { recursive: true });
+    const sourcePluginsDir = await makeSourcePluginsDir(sourceDir);
+    const seedDir = resolvePluginSeedDir(env, FAKE_COMPANY_ID, FAKE_SHA);
+    await publishPluginSeed({ sourcePluginsDir, seedDir, pluginsSha: FAKE_SHA, companyId: FAKE_COMPANY_ID, env });
 
-      const codexHome = await makeCodexHome(tmp);
-      // Pre-populate plugins dir.
-      await fs.mkdir(path.join(codexHome, ".tmp", "plugins"), { recursive: true });
-      const result = await applyPluginSeed({ codexHome, seedDir, pluginsSha: FAKE_SHA, isRestricted: false });
-      assert.equal(result, "already_present");
-    } finally {
-      await fs.rm(tmp, { recursive: true, force: true });
-    }
+    const codexHome = await makeCodexHome(tmp);
+    await fs.mkdir(path.join(codexHome, ".tmp", "plugins"), { recursive: true });
+    const result = await applyPluginSeed({ codexHome, seedDir, pluginsSha: FAKE_SHA, isRestricted: false });
+    expect(result).toBe("already_present");
   });
 });
+
+// ── readPluginsSha ─────────────────────────────────────────────────────────
 
 describe("readPluginsSha", () => {
   it("returns sha from valid .tmp/plugins.sha", async () => {
     const tmp = await makeTmpDir();
-    try {
-      const codexHome = path.join(tmp, "home");
-      await fs.mkdir(path.join(codexHome, ".tmp"), { recursive: true });
-      await fs.writeFile(path.join(codexHome, ".tmp", "plugins.sha"), FAKE_SHA + "\n");
-      const sha = await readPluginsSha(codexHome);
-      assert.equal(sha, FAKE_SHA);
-    } finally {
-      await fs.rm(tmp, { recursive: true, force: true });
-    }
+    const codexHome = path.join(tmp, "home");
+    await fs.mkdir(path.join(codexHome, ".tmp"), { recursive: true });
+    await fs.writeFile(path.join(codexHome, ".tmp", "plugins.sha"), FAKE_SHA + "\n");
+    const sha = await readPluginsSha(codexHome);
+    expect(sha).toBe(FAKE_SHA);
   });
 
   it("returns null when file absent", async () => {
     const tmp = await makeTmpDir();
-    try {
-      const sha = await readPluginsSha(tmp);
-      assert.equal(sha, null);
-    } finally {
-      await fs.rm(tmp, { recursive: true, force: true });
-    }
+    const sha = await readPluginsSha(tmp);
+    expect(sha).toBeNull();
   });
 
   it("returns null for non-hex content", async () => {
     const tmp = await makeTmpDir();
-    try {
-      const codexHome = path.join(tmp, "home");
-      await fs.mkdir(path.join(codexHome, ".tmp"), { recursive: true });
-      await fs.writeFile(path.join(codexHome, ".tmp", "plugins.sha"), "not-a-sha");
-      const sha = await readPluginsSha(codexHome);
-      assert.equal(sha, null);
-    } finally {
-      await fs.rm(tmp, { recursive: true, force: true });
-    }
+    const codexHome = path.join(tmp, "home");
+    await fs.mkdir(path.join(codexHome, ".tmp"), { recursive: true });
+    await fs.writeFile(path.join(codexHome, ".tmp", "plugins.sha"), "not-a-sha");
+    const sha = await readPluginsSha(codexHome);
+    expect(sha).toBeNull();
   });
 });
