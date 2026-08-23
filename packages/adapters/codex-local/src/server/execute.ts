@@ -87,6 +87,12 @@ import {
   resolveCodexAuthPrecedence,
 } from "./auth-precedence.js";
 import { prepareCodexRuntimeConfig } from "./runtime-config.js";
+import {
+  applyPluginSeed,
+  isPluginSeedEnabled,
+  readPluginsSha,
+  resolvePluginSeedDir,
+} from "./codex-plugin-seed.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
 import { buildCodexExecArgs } from "./codex-args.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -685,6 +691,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
   const effectiveCodexHome = configuredCodexHome ?? defaultCodexHome;
   await fs.mkdir(effectiveCodexHome, { recursive: true });
+
+  // Plugin seed canary — KEWL-3853 Option B.
+  // Applies only to unrestricted codex_local runs when CODEX_SHARED_PLUGIN_SEED_ENABLED=1.
+  // Restricted runs are excluded via isRestricted; if runtimeToolPolicy lands on this
+  // branch, pass runtimeToolPolicy.restricted here instead.
+  if (isPluginSeedEnabled(process.env) && agent.companyId) {
+    const sharedPluginsSha = await readPluginsSha(resolveSharedCodexHomeDir(process.env));
+    if (sharedPluginsSha) {
+      const seedDir = resolvePluginSeedDir(process.env, agent.companyId, sharedPluginsSha);
+      await applyPluginSeed({
+        codexHome: effectiveCodexHome,
+        seedDir,
+        pluginsSha: sharedPluginsSha,
+        isRestricted: false, // replace with runtimeToolPolicy.restricted when that lands
+        onLog,
+      });
+    }
+  }
 
   // Never launch a managed CODEX_HOME with no credentials. Without auth.json
   // and with OPENAI_API_KEY="" the provider rejects every request with
