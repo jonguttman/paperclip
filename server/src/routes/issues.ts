@@ -9247,9 +9247,21 @@ export function issueRoutes(
       const id = req.params.id as string;
       const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
       if (!issue) return;
-      assertBoard(req);
+      if (req.actor.type !== "agent") assertBoard(req);
 
-      if (req.actor.source !== "local_implicit") {
+      const actor = getActorInfo(req);
+      if (actor.actorType === "agent") {
+        const currentParticipant = parseIssueExecutionState(issue.executionState)?.currentParticipant;
+        if (
+          !actor.agentId
+          || currentParticipant?.type !== "agent"
+          || currentParticipant.agentId !== actor.agentId
+        ) {
+          throw forbidden("Only the current execution participant can decide this stalled review");
+        }
+      }
+
+      if (actor.actorType === "user" && req.actor.source !== "local_implicit") {
         const userId = req.actor.userId?.trim();
         const membership = userId
           ? await db
@@ -9268,14 +9280,15 @@ export function issueRoutes(
         }
       }
 
-      const actor = getActorInfo(req);
       const result = await stalledReviewDecisionService(db).decide({
         issueId: issue.id,
         companyId: issue.companyId,
         action: req.body.action,
         note: req.body.note,
         actor: {
-          userId: actor.actorId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
           runId: actor.runId,
         },
       });
@@ -9311,8 +9324,12 @@ export function issueRoutes(
 
       let wakeQueued = false;
       if (req.body.action !== "approve" && result.issue.assigneeAgentId) {
-        const userAuthoredNote = result.comment
+        const authoredNote = result.comment
           ? { commentId: result.comment.id, authorUserId: actor.actorId }
+          : undefined;
+        const userAuthoredNote = actor.actorType === "user" ? authoredNote : undefined;
+        const agentAuthoredNote = actor.actorType === "agent" && result.comment
+          ? { commentId: result.comment.id, authorAgentId: actor.actorId }
           : undefined;
         try {
           const wake = await enqueueStalledReviewDecisionWakeup(result.issue.assigneeAgentId, {
@@ -9320,7 +9337,7 @@ export function issueRoutes(
             triggerDetail: "system",
             reason: "issue_status_changed",
             idempotencyKey: `stalled-review-decision:${result.issue.id}:${req.body.action}`,
-            requestedByActorType: "user",
+            requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
             payload: {
               issueId: result.issue.id,
@@ -9328,6 +9345,7 @@ export function issueRoutes(
               reviewDecision: req.body.action,
               resumeIntent: true,
               ...(userAuthoredNote ? { userAuthoredNote } : {}),
+              ...(agentAuthoredNote ? { agentAuthoredNote } : {}),
             },
             contextSnapshot: {
               issueId: result.issue.id,
@@ -9337,6 +9355,7 @@ export function issueRoutes(
               reviewDecision: req.body.action,
               resumeIntent: true,
               ...(userAuthoredNote ? { userAuthoredNote } : {}),
+              ...(agentAuthoredNote ? { agentAuthoredNote } : {}),
             },
           });
           wakeQueued = wake !== null;

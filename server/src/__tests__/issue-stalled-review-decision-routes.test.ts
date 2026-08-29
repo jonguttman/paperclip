@@ -14,6 +14,7 @@ import {
   heartbeatRuns,
   issueApprovals,
   issueComments,
+  issueExecutionDecisions,
   issueInboxArchives,
   issueRecoveryActions,
   issueThreadInteractions,
@@ -48,6 +49,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
   afterEach(async () => {
     enqueueWakeup.mockClear();
     await db.delete(issueThreadInteractions);
+    await db.delete(issueExecutionDecisions);
     await db.delete(issueApprovals);
     await db.delete(approvals);
     await db.delete(issueComments);
@@ -186,7 +188,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     };
   }
 
-  function agentActor(companyId: string, agentId: string, runId = randomUUID()) {
+  function agentActor(companyId: string, agentId: string, runId: string | null = randomUUID()) {
     return {
       type: "agent",
       source: "agent_key",
@@ -196,7 +198,12 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     };
   }
 
-  async function seedRun(companyId: string, agentId: string, issueId: string) {
+  async function seedRun(
+    companyId: string,
+    agentId: string,
+    issueId: string,
+    status: "running" | "succeeded" = "running",
+  ) {
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({
       id: runId,
@@ -204,11 +211,189 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       agentId,
       invocationSource: "assignment",
       triggerDetail: "system",
-      status: "running",
+      status,
+      ...(status === "succeeded" ? { finishedAt: new Date() } : {}),
       contextSnapshot: { issueId, wakeReason: "issue_assigned" },
     });
     return runId;
   }
+
+  async function seedStalledExecutionReview(input: {
+    companyId: string;
+    reviewerAgentId: string;
+    returnAgentId: string;
+    identifier: string;
+  }) {
+    const issueId = await seedReview({
+      companyId: input.companyId,
+      assigneeAgentId: input.reviewerAgentId,
+      identifier: input.identifier,
+    });
+    const stageId = randomUUID();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, input.reviewerAgentId));
+    await db.update(issues).set({
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [{
+          id: stageId,
+          type: "review",
+          approvalsNeeded: 1,
+          participants: [{ id: randomUUID(), type: "agent", agentId: input.reviewerAgentId }],
+        }],
+      },
+      executionState: {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: input.reviewerAgentId },
+        returnAssignee: { type: "agent", agentId: input.returnAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).where(eq(issues.id, issueId));
+    return { issueId, stageId };
+  }
+
+  it("lets the stalled current-participant agent approve and records the stage exactly once", async () => {
+    const seeded = await seedCompany("APR");
+    const { issueId, stageId } = await seedStalledExecutionReview({
+      companyId: seeded.companyId,
+      reviewerAgentId: seeded.assigneeAgentId,
+      returnAgentId: seeded.peerAgentId,
+      identifier: "APR-1",
+    });
+    const runId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId, "succeeded");
+    const reviewer = app(agentActor(seeded.companyId, seeded.assigneeAgentId, runId));
+
+    const response = await request(reviewer)
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "approve" })
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      action: "approve",
+      wakeQueued: false,
+      issue: {
+        id: issueId,
+        status: "done",
+        executionState: {
+          status: "completed",
+          completedStageIds: [stageId],
+          lastDecisionOutcome: "approved",
+        },
+      },
+    });
+    const decisions = await db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({
+      stageId,
+      actorAgentId: seeded.assigneeAgentId,
+      actorUserId: null,
+      outcome: "approved",
+      createdByRunId: runId,
+    });
+
+    await request(reviewer)
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "approve" })
+      .expect(403);
+    expect(await db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId))).toHaveLength(1);
+  });
+
+  it("lets the stalled current-participant agent request changes and returns ownership exactly once", async () => {
+    const seeded = await seedCompany("CHG");
+    const { issueId, stageId } = await seedStalledExecutionReview({
+      companyId: seeded.companyId,
+      reviewerAgentId: seeded.assigneeAgentId,
+      returnAgentId: seeded.peerAgentId,
+      identifier: "CHG-1",
+    });
+    const runId = await seedRun(seeded.companyId, seeded.assigneeAgentId, issueId, "succeeded");
+
+    const response = await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, runId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "request_changes", note: "Please address the failed invariant." })
+      .expect(200);
+
+    expect(response.body).toMatchObject({
+      action: "request_changes",
+      wakeQueued: true,
+      issue: {
+        id: issueId,
+        status: "in_progress",
+        assigneeAgentId: seeded.peerAgentId,
+        executionState: {
+          status: "changes_requested",
+          currentStageId: stageId,
+          currentParticipant: { type: "agent", agentId: seeded.assigneeAgentId },
+          returnAssignee: { type: "agent", agentId: seeded.peerAgentId },
+          lastDecisionOutcome: "changes_requested",
+        },
+      },
+      comment: {
+        issueId,
+        authorAgentId: seeded.assigneeAgentId,
+        authorUserId: null,
+        body: "Please address the failed invariant.",
+      },
+    });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    expect(enqueueWakeup).toHaveBeenCalledWith(seeded.peerAgentId, expect.objectContaining({
+      requestedByActorType: "agent",
+      requestedByActorId: seeded.assigneeAgentId,
+      payload: expect.objectContaining({
+        reviewDecision: "request_changes",
+        agentAuthoredNote: {
+          commentId: response.body.comment.id,
+          authorAgentId: seeded.assigneeAgentId,
+        },
+      }),
+    }));
+    const decisions = await db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({
+      stageId,
+      actorAgentId: seeded.assigneeAgentId,
+      outcome: "changes_requested",
+      createdByRunId: runId,
+    });
+
+    await request(app(agentActor(seeded.companyId, seeded.assigneeAgentId, runId)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "request_changes", note: "Please address the failed invariant." })
+      .expect(409);
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    expect(await db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId))).toHaveLength(1);
+  });
+
+  it("forbids an unrelated agent from deciding a stalled execution review", async () => {
+    const seeded = await seedCompany("FRB");
+    const { issueId } = await seedStalledExecutionReview({
+      companyId: seeded.companyId,
+      reviewerAgentId: seeded.assigneeAgentId,
+      returnAgentId: seeded.peerAgentId,
+      identifier: "FRB-1",
+    });
+
+    const response = await request(app(agentActor(seeded.companyId, seeded.peerAgentId, null)))
+      .post(`/api/issues/${issueId}/stalled-review-decision`)
+      .send({ action: "approve" })
+      .expect(403);
+    expect(response.body).toMatchObject({
+      error: "Only the current execution participant can decide this stalled review",
+    });
+    expect(await db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.issueId, issueId))).toHaveLength(0);
+    expect(await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId)))
+      .toEqual([{ status: "in_review" }]);
+  });
 
   it("denies agents, viewers, and cross-company users without exposing issue existence", async () => {
     const primary = await seedCompany("SRD");
