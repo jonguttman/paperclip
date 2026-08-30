@@ -291,6 +291,13 @@ describe("openapi routes", () => {
     });
     expect(spec.paths["/api/companies/{companyId}/cost-events"].post.responses["201"]).toBeDefined();
     expect(spec.paths["/api/companies/{companyId}/cost-events"].post.responses["403"]).toBeDefined();
+    const stalledReviewDecision = spec.paths["/api/issues/{id}/stalled-review-decision"].post;
+    expect(stalledReviewDecision.security).toEqual([
+      { BoardSessionAuth: [] },
+      { BoardApiKeyAuth: [] },
+      { AgentBearerAuth: [] },
+    ]);
+    expect(stalledReviewDecision["x-paperclip-authorization"]).toEqual({ actor: "board_or_agent" });
     expect(spec.paths["/api/instance/database-backups"].post.responses["201"]).toBeDefined();
     expect(spec.paths["/api/invites/{token}/accept"].post.responses["202"]).toBeDefined();
     expect(spec.paths["/api/board-api-keys"].post.responses["201"]).toBeDefined();
