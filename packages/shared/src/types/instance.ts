@@ -20,6 +20,42 @@ export const DEFAULT_BACKUP_RETENTION: BackupRetentionPolicy = {
 };
 
 /**
+ * `dailyDays`/`weeklyWeeks`/`monthlyMonths` are closed preset enums, not
+ * arbitrary integers — a config-supplied value (e.g. `retentionDays: 1`)
+ * that isn't one of the presets must be snapped to a supported value rather
+ * than silently rejected wholesale by the settings schema.
+ */
+export function clampToNearestPreset<T extends readonly number[]>(value: number, presets: T): T[number] {
+  return presets.reduce((closest, candidate) =>
+    Math.abs(candidate - value) < Math.abs(closest - value) ? candidate : closest,
+  presets[0]);
+}
+
+/**
+ * Like `clampToNearestPreset`, but never resolves to FEWER days than
+ * requested when a large-enough preset exists. "Nearest by distance" can
+ * round down (e.g. 9 -> 7 within [3, 7, 14]), which silently shortens an
+ * operator's requested retention below what they configured — for a backup
+ * retention policy that means pruning real restore points earlier than
+ * asked (KEWL-4636 P1). Rounding up trades a little extra disk for never
+ * under-delivering on a stated retention period.
+ *
+ * Still bottoms out at the largest preset when the requested value exceeds
+ * every preset (e.g. 30 -> 14 within [3, 7, 14]): a closed preset enum
+ * cannot represent an arbitrary value above its own ceiling. Callers that
+ * care about that gap should compare their input against the result and
+ * log when they differ — this function only guarantees "never below what's
+ * achievable", not "always exactly what was requested".
+ */
+export function clampToPresetCeiling<T extends readonly number[]>(value: number, presets: T): T[number] {
+  const sorted = [...presets].sort((a, b) => a - b);
+  for (const preset of sorted) {
+    if (preset >= value) return preset as T[number];
+  }
+  return sorted[sorted.length - 1] as T[number];
+}
+
+/**
  * Instance-wide execution policy.
  *
  * - `"any"` (default / absent): unrestricted — any environment driver (local,

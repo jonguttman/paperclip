@@ -14,6 +14,8 @@ export type InstanceSettingsWriteDb = Pick<
 import {
   DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
   DEFAULT_BACKUP_RETENTION,
+  DAILY_RETENTION_PRESETS,
+  clampToPresetCeiling,
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   PAPERCLIP_CLOUD_MANAGED_BY,
   instanceGeneralSettingsSchema,
@@ -39,6 +41,24 @@ const TRUTHY_RUNTIME_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
 interface InstanceSettingsServiceOptions {
   runtimeEnv?: Record<string, string | undefined>;
   now?: () => Date;
+  /**
+   * Config-file (`database.backup.retentionDays`) value to seed the daily
+   * backup-retention tier with, but ONLY when the instance settings row is
+   * being created for the first time. Once a row exists (default or
+   * explicitly customized), the DB stays authoritative — that's the whole
+   * point of storing it there instead of re-reading config.json on every
+   * backup (KEWL-4636). `dailyDays` is a closed preset enum, not an
+   * arbitrary integer, so this is clamped UP to the nearest achievable
+   * preset (`clampToPresetCeiling`) rather than to the nearest by distance —
+   * an operator's configured retention period must never be silently
+   * shortened by the clamp (KEWL-4636 P1: e.g. a configured 9 rounding down
+   * to a 7-day daily tier would prune real backups two days earlier than
+   * requested). It can still fall short of an arbitrary value above the
+   * largest preset (e.g. 30 -> 14) — the closed enum simply cannot
+   * represent that; the per-backup drift warning below covers making that
+   * gap loud instead of silent.
+   */
+  bootstrapBackupRetentionDailyDays?: number;
 }
 
 type WorktreeRunExecutionSuppressedReason =
@@ -355,11 +375,19 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
     if (existing) return existing;
 
     const now = new Date();
+    const bootstrapGeneral = options.bootstrapBackupRetentionDailyDays != null
+      ? {
+          backupRetention: {
+            ...DEFAULT_BACKUP_RETENTION,
+            dailyDays: clampToPresetCeiling(options.bootstrapBackupRetentionDailyDays, DAILY_RETENTION_PRESETS),
+          },
+        }
+      : {};
     const [created] = await runner
       .insert(instanceSettings)
       .values({
         singletonKey: DEFAULT_SINGLETON_KEY,
-        general: {},
+        general: bootstrapGeneral,
         experimental: {},
         createdAt: now,
         updatedAt: now,
