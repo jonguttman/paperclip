@@ -686,6 +686,20 @@ export async function startServer(): Promise<StartedServer> {
   const backupSettingsSvc = instanceSettingsService(db, {
     bootstrapBackupRetentionDailyDays: config.databaseBackupRetentionDays,
   });
+  // Force the Instance Settings singleton row to be created/seeded RIGHT NOW,
+  // synchronously in the boot sequence, before any other reader gets a
+  // chance to. getOrCreateRow() lazily inserts the row on first read, and
+  // whichever caller reads first wins forever after (the DB is authoritative
+  // once a row exists, by design). Several other call sites construct their
+  // OWN unconfigured `instanceSettingsService(db)` later in this very same
+  // startup sequence (e.g. resolveWorktreeRunExecutionActivationState below)
+  // and the server begins accepting requests (server.listen) further still
+  // — any one of those winning the race silently and permanently drops the
+  // config.json bootstrap value with no signal anywhere it happened
+  // (KEWL-4636 P1). Awaiting here, immediately after construction and before
+  // anything else touches instance settings, makes the configured seed the
+  // guaranteed winner instead of a race.
+  await backupSettingsSvc.getGeneral();
   const databaseBackupMaxAgeHours = Math.max(
     1,
     Number(process.env.PAPERCLIP_DB_BACKUP_MAX_AGE_HOURS) ||
