@@ -678,7 +678,14 @@ export async function startServer(): Promise<StartedServer> {
   const feedback = feedbackService(db as any, {
     shareClient: createFeedbackTraceShareClientFromConfig(config),
   });
-  const backupSettingsSvc = instanceSettingsService(db);
+  // Seeds the daily backup-retention tier from config.json ONLY when the
+  // instance settings row is created for the first time — see KEWL-4636.
+  // Config.json is otherwise not re-read for retention; the DB stays
+  // authoritative once a row exists (comment at runServerDatabaseBackup
+  // below explains why: hot-reload without a restart).
+  const backupSettingsSvc = instanceSettingsService(db, {
+    bootstrapBackupRetentionDailyDays: config.databaseBackupRetentionDays,
+  });
   const databaseBackupMaxAgeHours = Math.max(
     1,
     Number(process.env.PAPERCLIP_DB_BACKUP_MAX_AGE_HOURS) ||
@@ -714,6 +721,21 @@ export async function startServer(): Promise<StartedServer> {
       // Read retention from Instance Settings (DB) so changes take effect without restart.
       const generalSettings = await backupSettingsSvc.getGeneral();
       const retention = generalSettings.backupRetention;
+      // config.json's retentionDays only seeds a BRAND NEW settings row (see
+      // bootstrapBackupRetentionDailyDays above); once a row exists it is
+      // deliberately not re-consulted. That's easy to mistake for "broken"
+      // (KEWL-4636 — an operator's `retentionDays: 1` had zero effect on the
+      // running server for days with no signal anywhere it was being
+      // ignored). Say so loudly instead of staying silent.
+      if (config.databaseBackupRetentionDays !== retention.dailyDays) {
+        logger.warn(
+          {
+            configRetentionDays: config.databaseBackupRetentionDays,
+            effectiveDailyDays: retention.dailyDays,
+          },
+          "config.json database.backup.retentionDays does not match the effective Instance Settings backup retention — config.json is only a bootstrap default and is not applied to an existing instance settings row; update backup retention via Instance Settings to change the live value",
+        );
+      }
 
       const result = await runDatabaseBackup({
         connectionString: activeDatabaseConnectionString,

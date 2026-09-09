@@ -20,6 +20,18 @@ export const DEFAULT_BACKUP_RETENTION: BackupRetentionPolicy = {
 };
 
 /**
+ * `dailyDays`/`weeklyWeeks`/`monthlyMonths` are closed preset enums, not
+ * arbitrary integers — a config-supplied value (e.g. `retentionDays: 1`)
+ * that isn't one of the presets must be snapped to the nearest supported
+ * value rather than silently rejected wholesale by the settings schema.
+ */
+export function clampToNearestPreset<T extends readonly number[]>(value: number, presets: T): T[number] {
+  return presets.reduce((closest, candidate) =>
+    Math.abs(candidate - value) < Math.abs(closest - value) ? candidate : closest,
+  presets[0]);
+}
+
+/**
  * Instance-wide execution policy.
  *
  * - `"any"` (default / absent): unrestricted — any environment driver (local,
