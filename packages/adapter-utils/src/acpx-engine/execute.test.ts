@@ -2781,6 +2781,7 @@ describe("shared ACPX engine runtime behavior", () => {
     });
 
     const logs: Array<{ stream: string; text: string }> = [];
+    const events: Array<{ eventType: string; payload?: Record<string, unknown> }> = [];
     const result = await execute({
       runId,
       agent: { id: "agent-1", companyId: "company-1" },
@@ -2789,6 +2790,9 @@ describe("shared ACPX engine runtime behavior", () => {
       context: {},
       onLog: async (stream: "stdout" | "stderr", text: string) => {
         logs.push({ stream, text });
+      },
+      onEvent: async (event: { eventType: string; payload?: Record<string, unknown> }) => {
+        events.push(event);
       },
       onMeta: async () => {},
     } as never);
@@ -2802,6 +2806,14 @@ describe("shared ACPX engine runtime behavior", () => {
       fs.readFile(path.join(stateDir, "codex-run-homes", `${runId}.quarantine`), "utf8"),
     ).resolves.toContain("raw_run_home_cleanup_failed");
     expect(logs.some((entry) => entry.text.includes("INCIDENT") && entry.text.includes("cleanup failed"))).toBe(true);
+    expect(events).toContainEqual(expect.objectContaining({
+      eventType: "acpx.codex_run_home.quarantine",
+      payload: expect.objectContaining({
+        runId,
+        reason: "raw_run_home_cleanup_failed",
+        quarantineMarkerWritten: true,
+      }),
+    }));
   });
 
   it("does not discard retained sessions when the post-delete log sink fails", async () => {
@@ -2903,6 +2915,7 @@ describe("shared ACPX engine runtime behavior", () => {
     });
 
     const logs: Array<{ stream: string; text: string }> = [];
+    const events: Array<{ eventType: string; payload?: Record<string, unknown> }> = [];
     const result = await execute({
       runId,
       agent: { id: "agent-1", companyId: "company-1" },
@@ -2916,6 +2929,9 @@ describe("shared ACPX engine runtime behavior", () => {
       context: {},
       onLog: async (stream: "stdout" | "stderr", text: string) => {
         logs.push({ stream, text });
+      },
+      onEvent: async (event: { eventType: string; payload?: Record<string, unknown> }) => {
+        events.push(event);
       },
       onMeta: async () => {},
     } as never);
@@ -2931,6 +2947,14 @@ describe("shared ACPX engine runtime behavior", () => {
     await expect(fs.stat(path.join(stateDir, "codex-session-retention", runId))).rejects.toThrow();
     expect(logs.some((entry) => entry.stream === "stderr" && entry.text.includes("INCIDENT"))).toBe(true);
     expect(logs.every((entry) => !entry.text.includes("Deleted raw Codex run home"))).toBe(true);
+    expect(events).toContainEqual(expect.objectContaining({
+      eventType: "acpx.codex_run_home.quarantine",
+      payload: expect.objectContaining({
+        runId,
+        reason: "sanitized_session_retention_failed",
+        quarantineMarkerWritten: true,
+      }),
+    }));
   });
 
   it("quarantines the raw run home when runtime close is not confirmed", async () => {
@@ -2974,6 +2998,7 @@ describe("shared ACPX engine runtime behavior", () => {
     });
 
     const logs: Array<{ stream: string; text: string }> = [];
+    const events: Array<{ eventType: string; payload?: Record<string, unknown> }> = [];
     const result = await execute({
       runId,
       agent: { id: "agent-1", companyId: "company-1" },
@@ -2988,6 +3013,9 @@ describe("shared ACPX engine runtime behavior", () => {
       onLog: async (stream: "stdout" | "stderr", text: string) => {
         logs.push({ stream, text });
       },
+      onEvent: async (event: { eventType: string; payload?: Record<string, unknown> }) => {
+        events.push(event);
+      },
       onMeta: async () => {},
     } as never);
 
@@ -2998,15 +3026,25 @@ describe("shared ACPX engine runtime behavior", () => {
     await expect(fs.stat(path.join(stateDir, "codex-session-retention", runId))).rejects.toThrow();
     expect(logs.some((entry) => entry.text.includes("runtime close was not confirmed"))).toBe(true);
     expect(logs.every((entry) => !entry.text.includes("Deleted raw Codex run home"))).toBe(true);
+    expect(events).toContainEqual(expect.objectContaining({
+      eventType: "acpx.codex_run_home.quarantine",
+      payload: expect.objectContaining({
+        runId,
+        reason: "runtime_close_unconfirmed",
+        quarantineMarkerWritten: true,
+      }),
+    }));
   });
 
-  it("restricted-run isolation still holds after Fix A — restricted run gets its own unmanaged CODEX_HOME (KEWL-3852 AC3)", async () => {
-    // A restricted run (runtimeToolPolicy.restricted=true) must still get an isolated
-    // CODEX_HOME under codex-run-homes/<runId>/home.  Fix A must not weaken that boundary.
+  it("keeps every codex_local run on a distinct Paperclip-managed isolated CODEX_HOME (KEWL-3852 AC3)", async () => {
+    // Run-home selection is unconditional for codex_local: runtimeToolPolicy is
+    // enforced outside this engine and is not an input to this branch. Prove the
+    // actual boundary here by running two executions from one source home and
+    // requiring distinct run-scoped homes for both.
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const sourceCodexHome = path.join(root, "source-codex-home");
-    const runId = "run-restricted-isolation";
+    const runIds = ["run-isolation-a", "run-isolation-b"];
 
     await fs.mkdir(sourceCodexHome, { recursive: true });
     await fs.writeFile(path.join(sourceCodexHome, "config.toml"), "model_provider = \"openai\"\n", "utf8");
@@ -3038,31 +3076,34 @@ describe("shared ACPX engine runtime behavior", () => {
     });
 
     const logs: Array<{ stream: string; text: string }> = [];
-    await execute({
-      runId,
-      agent: { id: "agent-1", companyId: "company-1" },
-      runtime: { runtimeToolPolicy: { restricted: true, enforcement: "required" } },
-      config: {
-        agent: "codex",
-        stateDir,
-        warmHandleIdleMs: 60_000,
-        env: { CODEX_HOME: sourceCodexHome },
-      },
-      context: {},
-      onLog: async (stream: "stdout" | "stderr", text: string) => {
-        logs.push({ stream, text });
-      },
-      onMeta: async () => {},
-    } as never);
+    for (const runId of runIds) {
+      await execute({
+        runId,
+        agent: { id: "agent-1", companyId: "company-1" },
+        runtime: {},
+        config: {
+          agent: "codex",
+          stateDir,
+          warmHandleIdleMs: 60_000,
+          env: { CODEX_HOME: sourceCodexHome },
+        },
+        context: {},
+        onLog: async (stream: "stdout" | "stderr", text: string) => {
+          logs.push({ stream, text });
+        },
+        onMeta: async () => {},
+      } as never);
+    }
 
-    // The CODEX_HOME must be an isolated run-specific directory, not the source home.
-    const expectedRunHome = path.join(stateDir, "codex-run-homes", runId, "home");
-    expect(capturedCodexHome.length).toBeGreaterThan(0);
-    expect(capturedCodexHome[0]).toBe(expectedRunHome);
-    // And it must not be the original source home
-    expect(capturedCodexHome[0]).not.toBe(sourceCodexHome);
-    // The isolation log line must appear
-    expect(logs.some((entry) => entry.text.includes("run-isolated") && entry.text.includes(runId))).toBe(true);
+    const expectedRunHomes = runIds.map((runId) =>
+      path.join(stateDir, "codex-run-homes", runId, "home")
+    );
+    expect(capturedCodexHome).toEqual(expectedRunHomes);
+    expect(new Set(capturedCodexHome).size).toBe(runIds.length);
+    expect(capturedCodexHome.every((home) => home !== sourceCodexHome)).toBe(true);
+    for (const runId of runIds) {
+      expect(logs.some((entry) => entry.text.includes("run-isolated") && entry.text.includes(runId))).toBe(true);
+    }
   });
 
   it("changes the ACPX session fingerprint when the resolved secret manifest rotates", async () => {

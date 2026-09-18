@@ -1179,6 +1179,7 @@ async function retainSanitizedCodexSessionJsonl(input: {
 async function retainSanitizedCodexSessionsAfterClose(input: {
   prepared: AcpxPreparedRuntime;
   onLog: AdapterExecutionContext["onLog"];
+  onEvent?: AdapterExecutionContext["onEvent"];
   removeRunHome?: (runHome: string) => Promise<void>;
 }): Promise<void> {
   if (!input.prepared.codexSessionRetention) return;
@@ -1211,6 +1212,21 @@ async function retainSanitizedCodexSessionsAfterClose(input: {
     }).catch((markerErr) => {
       quarantineMarkerError = markerErr;
     });
+    await input.onEvent?.({
+      eventType: "acpx.codex_run_home.quarantine",
+      stream: "stderr",
+      level: "error",
+      message: "Codex run home quarantined after sanitized session retention failed",
+      payload: {
+        schemaVersion: 1,
+        runId: path.basename(runHomeParent),
+        runHome,
+        quarantineMarker,
+        quarantineMarkerWritten: quarantineMarkerError === undefined,
+        reason: "sanitized_session_retention_failed",
+        error: err instanceof Error ? err.message : String(err),
+      },
+    }).catch(() => {});
     await input.onLog(
       "stderr",
       `[paperclip] INCIDENT: failed to retain sanitized ACPX Codex session JSONL; raw run home quarantined at "${runHome}"${quarantineMarkerError ? `, but marker creation at "${quarantineMarker}" also failed: ${quarantineMarkerError instanceof Error ? quarantineMarkerError.message : String(quarantineMarkerError)}` : ` with marker "${quarantineMarker}"`}: ${err instanceof Error ? err.message : String(err)}\n`,
@@ -1240,6 +1256,21 @@ async function retainSanitizedCodexSessionsAfterClose(input: {
     }).catch((markerErr) => {
       quarantineMarkerError = markerErr;
     });
+    await input.onEvent?.({
+      eventType: "acpx.codex_run_home.quarantine",
+      stream: "stderr",
+      level: "error",
+      message: "Codex run home quarantined after raw cleanup failed",
+      payload: {
+        schemaVersion: 1,
+        runId: path.basename(runHomeParent),
+        runHome,
+        quarantineMarker,
+        quarantineMarkerWritten: quarantineMarkerError === undefined,
+        reason: "raw_run_home_cleanup_failed",
+        error: err instanceof Error ? err.message : String(err),
+      },
+    }).catch(() => {});
     await input.onLog(
       "stderr",
       `[paperclip] INCIDENT: sanitized ACPX Codex session retention succeeded, but raw run-home cleanup failed at "${runHome}"${quarantineMarkerError ? ` and marker creation at "${quarantineMarker}" also failed: ${quarantineMarkerError instanceof Error ? quarantineMarkerError.message : String(quarantineMarkerError)}` : `; quarantined with marker "${quarantineMarker}"`}: ${err instanceof Error ? err.message : String(err)}\n`,
@@ -1258,6 +1289,7 @@ async function retainSanitizedCodexSessionsAfterClose(input: {
 async function quarantineCodexRunHomeWithoutClose(input: {
   prepared: AcpxPreparedRuntime;
   onLog: AdapterExecutionContext["onLog"];
+  onEvent?: AdapterExecutionContext["onEvent"];
   reason: string;
 }): Promise<void> {
   const retention = input.prepared.codexSessionRetention;
@@ -1280,6 +1312,21 @@ async function quarantineCodexRunHomeWithoutClose(input: {
   }).catch((markerErr) => {
     quarantineMarkerError = markerErr;
   });
+  await input.onEvent?.({
+    eventType: "acpx.codex_run_home.quarantine",
+    stream: "stderr",
+    level: "error",
+    message: "Codex run home quarantined because runtime close was not confirmed",
+    payload: {
+      schemaVersion: 1,
+      runId: path.basename(runHomeParent),
+      runHome: retention.runHome,
+      quarantineMarker,
+      quarantineMarkerWritten: quarantineMarkerError === undefined,
+      reason: "runtime_close_unconfirmed",
+      detail: input.reason,
+    },
+  }).catch(() => {});
   await input.onLog(
     "stderr",
     `[paperclip] INCIDENT: raw ACPX Codex run home quarantined because runtime close was not confirmed at "${retention.runHome}"${quarantineMarkerError ? `, but marker creation at "${quarantineMarker}" also failed: ${quarantineMarkerError instanceof Error ? quarantineMarkerError.message : String(quarantineMarkerError)}` : ` with marker "${quarantineMarker}"`}: ${input.reason}\n`,
@@ -5553,6 +5600,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             await retainSanitizedCodexSessionsAfterClose({
               prepared,
               onLog: ctx.onLog,
+              onEvent: ctx.onEvent,
               removeRunHome: deps.removeCodexRunHome,
             });
             return;
@@ -5561,6 +5609,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             await quarantineCodexRunHomeWithoutClose({
               prepared,
               onLog: ctx.onLog,
+              onEvent: ctx.onEvent,
               reason: "the runtime was transferred to the warm-session store",
             });
             return;
@@ -5608,6 +5657,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             await quarantineCodexRunHomeWithoutClose({
               prepared,
               onLog: ctx.onLog,
+              onEvent: ctx.onEvent,
               reason: "the runtime close was skipped after duplex channel loss",
             });
             return;
@@ -5623,6 +5673,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             await quarantineCodexRunHomeWithoutClose({
               prepared,
               onLog: ctx.onLog,
+              onEvent: ctx.onEvent,
               reason: "the abandoned session handshake had not returned a closeable handle",
             });
             return;
@@ -5646,6 +5697,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               await quarantineCodexRunHomeWithoutClose({
                 prepared,
                 onLog: ctx.onLog,
+                onEvent: ctx.onEvent,
                 reason: `warm runtime close failed: ${closeErr instanceof Error ? closeErr.message : String(closeErr)}`,
               });
               throw closeErr;
@@ -5653,6 +5705,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             await retainSanitizedCodexSessionsAfterClose({
               prepared,
               onLog: ctx.onLog,
+              onEvent: ctx.onEvent,
               removeRunHome: deps.removeCodexRunHome,
             });
             return;
@@ -5678,12 +5731,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             await retainSanitizedCodexSessionsAfterClose({
               prepared,
               onLog: ctx.onLog,
+              onEvent: ctx.onEvent,
               removeRunHome: deps.removeCodexRunHome,
             });
           } else {
             await quarantineCodexRunHomeWithoutClose({
               prepared,
               onLog: ctx.onLog,
+              onEvent: ctx.onEvent,
               reason: "runtime.close did not complete successfully",
             });
           }

@@ -1439,7 +1439,9 @@ Networking behavior for this smoke script:
 
 Local Codex runs use a private home under
 `<company-dir>/acp-engine/agents/<agent-id>/codex-run-homes/<run-id>/home`.
-This preserves the restricted-run isolation boundary.
+This isolation is unconditional for local Codex ACP executions: two runs never
+share writable `CODEX_HOME` state, including when a restricted runtime policy is
+enforced upstream.
 Paperclip keeps sanitized session JSONL after the runtime closes. It then removes
 the raw run home. Successful retention writes an atomic
 `retention-complete.json` manifest, including for valid zero-session runs. If
@@ -1448,7 +1450,13 @@ preserves the home, and writes a sibling `<run-id>.quarantine` marker. If raw-ho
 deletion fails after retention succeeds, Paperclip preserves both the durable
 retained counterpart and whatever remains of the raw home, writes the quarantine
 marker with reason `raw_run_home_cleanup_failed`, and emits the same visible
-`INCIDENT` log signal used by the retention and close failure paths.
+`INCIDENT` log signal used by the retention and close failure paths. Every
+quarantine path also emits an `acpx.codex_run_home.quarantine` runtime event at
+error level. Its version-1 payload includes `runId`, `runHome`,
+`quarantineMarker`, `quarantineMarkerWritten`, and a machine-readable `reason`
+(`sanitized_session_retention_failed`, `raw_run_home_cleanup_failed`, or
+`runtime_close_unconfirmed`). Consumers should alert on the structured event;
+the sibling marker remains the durable filesystem audit record.
 
 The orphan sweeper is dry-run only unless `--delete` is present:
 
