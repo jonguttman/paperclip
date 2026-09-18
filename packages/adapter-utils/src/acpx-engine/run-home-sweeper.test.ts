@@ -136,6 +136,27 @@ describe("run-home sweeper", () => {
       expect(entry!.deleted).toBeUndefined();
     });
 
+    it("reports an empty run wrapper without mutating it", async () => {
+      const runDir = path.join(
+        companyDir,
+        "acp-engine",
+        "agents",
+        "agent-1",
+        "codex-run-homes",
+        "run-startup-window",
+      );
+      await fs.mkdir(runDir, { recursive: true });
+
+      const result = await sweep({ companyDir, dryRun: true, graceHours: 24 });
+
+      expect(result.entries).toContainEqual(expect.objectContaining({
+        runId: "run-startup-window",
+        eligible: false,
+        ineligibleReason: "raw home absent; wrapper retained",
+      }));
+      await expect(fs.stat(runDir)).resolves.toBeDefined();
+    });
+
     it("marks ineligible homes in the manifest with a reason", async () => {
       // Home within grace window (only 1 hour old)
       await buildRunHome({
@@ -244,6 +265,8 @@ describe("run-home sweeper", () => {
           destructiveRecoveryEnabled: false,
         },
       });
+      expect(result.noCounterpartOrphans).toBe(1);
+      expect(result.bytesAtRisk).toBe(0);
       // Even delete mode never deletes a no-counterpart orphan. The manifest is
       // evidence for a separate operator-approved recovery workflow only.
       await expect(fs.stat(runHomeDir)).resolves.toBeDefined();
@@ -492,6 +515,8 @@ describe("run-home sweeper", () => {
       expect(entry).toBeDefined();
       expect(entry!.eligible).toBe(false);
       expect(entry!.ineligibleReason).toMatch(/retained/i);
+      expect(result.noCounterpartOrphans).toBe(1);
+      expect(result.bytesAtRisk).toBeGreaterThan(0);
 
       // Must not be deleted
       const stat = await fs.stat(runHomeDir).catch(() => null);
@@ -842,6 +867,8 @@ describe("run-home sweeper", () => {
       );
 
       expect(result.eligible).toBe(0);
+      expect(result.inspectionFailures).toBe(1);
+      expect(result.errors).toBe(1);
       expect(result.entries[0]?.ineligibleReason).toMatch(/open-handle check failed.*lsof unavailable/i);
       await expect(fs.stat(runHomeDir)).resolves.toBeDefined();
     });

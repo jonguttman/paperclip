@@ -23,13 +23,19 @@ Retention reads at most 8 MiB per JSONL and 32 MiB per run before synchronous
 redaction. Any oversize, unreadable, invalid-text, or partial copy quarantines
 the raw home. Completed retained runs use a 30-day TTL plus per-agent caps of
 1,000 runs and 1 GiB. Cleanup is auditable and dry-run by default; destructive
-execution requires an explicit operator flag and is not scheduled.
+execution requires an explicit operator flag and is not scheduled. Cap
+selection continues past protected raw-home counterparts, and the manifest
+reports any residual run/byte excess that fail-closed exclusions prevent it
+from removing.
 
 Hard-loss homes without a counterpart remain undeletable. The raw-home dry-run
 manifest classifies them and separately reports whether the stricter review
 preconditions hold: terminal ownership, at least seven days old and at least
 twice the normal grace, zero open handles, and zero raw JSONL. The report does
 not implement or authorize recovery deletion.
+Inspection failures, hard-loss-orphan counts, and bytes at risk are explicit
+aggregate fields and CLI summary values. Empty run wrappers are reported but
+never mutated by the sweeper because they can be a live startup window.
 
 ## Risks
 

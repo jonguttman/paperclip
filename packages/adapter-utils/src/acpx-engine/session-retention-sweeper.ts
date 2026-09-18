@@ -35,6 +35,7 @@ export interface SessionRetentionEntry {
   expiredByCountCap: boolean;
   expiredByByteCap: boolean;
   eligible: boolean;
+  inspectionFailure?: boolean;
   rawRunHomePresent: boolean;
   quarantineMarkerPresent: boolean;
   quarantineMarkerInvalid?: boolean;
@@ -50,6 +51,10 @@ function isPathBelow(root: string, candidate: string): boolean {
   const resolvedRoot = path.resolve(root);
   const resolvedCandidate = path.resolve(candidate);
   return resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`);
+}
+
+function isErrnoException(err: unknown, code: string): err is NodeJS.ErrnoException {
+  return err instanceof Error && "code" in err && err.code === code;
 }
 
 async function inspectTree(root: string, dir = root): Promise<number> {
@@ -82,8 +87,11 @@ export async function sweepCodexSessionRetention(options: SessionRetentionSweepO
   eligible: number;
   deleted: number;
   errors: number;
+  inspectionFailures: number;
   bytesEligible: number;
   bytesDeleted: number;
+  runsStillOverCap: number;
+  bytesStillOverCap: number;
   entries: SessionRetentionEntry[];
 }> {
   if (!options.dryRun && options.operatorApproved !== true) {
@@ -112,9 +120,23 @@ export async function sweepCodexSessionRetention(options: SessionRetentionSweepO
     !engineStat?.isDirectory() || engineStat.isSymbolicLink() ||
     !agentsStat?.isDirectory() || agentsStat.isSymbolicLink()
   ) {
-    return { policy, scanned: 0, eligible: 0, deleted: 0, errors: 0, bytesEligible: 0, bytesDeleted: 0, entries };
+    return {
+      policy,
+      scanned: 0,
+      eligible: 0,
+      deleted: 0,
+      errors: 0,
+      inspectionFailures: 0,
+      bytesEligible: 0,
+      bytesDeleted: 0,
+      runsStillOverCap: 0,
+      bytesStillOverCap: 0,
+      entries,
+    };
   }
 
+  let runsStillOverCap = 0;
+  let bytesStillOverCap = 0;
   for (const agentId of await fs.readdir(agentsDir).catch(() => [] as string[])) {
     const agentDir = path.join(agentsDir, agentId);
     if (!isPathBelow(agentsDir, agentDir)) continue;
@@ -144,6 +166,7 @@ export async function sweepCodexSessionRetention(options: SessionRetentionSweepO
           expiredByCountCap: false,
           expiredByByteCap: false,
           eligible: false,
+          inspectionFailure: true,
           rawRunHomePresent: false,
           quarantineMarkerPresent: false,
           wouldDeleteQuarantineMarker: false,
@@ -165,6 +188,7 @@ export async function sweepCodexSessionRetention(options: SessionRetentionSweepO
           expiredByCountCap: false,
           expiredByByteCap: false,
           eligible: false,
+          inspectionFailure: true,
           rawRunHomePresent: false,
           quarantineMarkerPresent: false,
           wouldDeleteQuarantineMarker: false,
@@ -174,12 +198,27 @@ export async function sweepCodexSessionRetention(options: SessionRetentionSweepO
       }
       const rawRunHome = path.join(runHomesRoot, runId, "home");
       const marker = path.join(runHomesRoot, `${runId}.quarantine`);
-      const rawRunHomePresent = runHomesRootUnsafe
-        ? false
-        : await fs.lstat(rawRunHome).then(() => true, () => false);
-      const markerStat = runHomesRootUnsafe
-        ? null
-        : await fs.lstat(marker).catch(() => null);
+      let pathInspectionError: string | undefined;
+      let rawRunHomePresent = false;
+      let markerStat: Awaited<ReturnType<typeof fs.lstat>> | null = null;
+      if (!runHomesRootUnsafe) {
+        try {
+          await fs.lstat(rawRunHome);
+          rawRunHomePresent = true;
+        } catch (err) {
+          if (!isErrnoException(err, "ENOENT")) {
+            pathInspectionError = `raw run home could not be inspected: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        }
+        try {
+          markerStat = await fs.lstat(marker);
+        } catch (err) {
+          if (!isErrnoException(err, "ENOENT")) {
+            pathInspectionError ??=
+              `quarantine marker could not be inspected: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        }
+      }
       const quarantineMarkerPresent = markerStat?.isFile() === true && !markerStat.isSymbolicLink();
       const quarantineMarkerInvalid = markerStat !== null && !quarantineMarkerPresent;
       candidates.push({
@@ -193,11 +232,14 @@ export async function sweepCodexSessionRetention(options: SessionRetentionSweepO
         expiredByCountCap: false,
         expiredByByteCap: false,
         eligible: false,
+        inspectionFailure: runHomesRootUnsafe || quarantineMarkerInvalid || pathInspectionError !== undefined,
         rawRunHomePresent,
         quarantineMarkerPresent,
         quarantineMarkerInvalid,
         wouldDeleteQuarantineMarker: quarantineMarkerPresent && !rawRunHomePresent,
-        ...(runHomesRootUnsafe
+        ...(pathInspectionError
+          ? { ineligibleReason: pathInspectionError }
+          : runHomesRootUnsafe
           ? { ineligibleReason: "Codex run-home root is not a real directory" }
           : quarantineMarkerInvalid
             ? { ineligibleReason: "quarantine marker path is not a real file" }
@@ -263,27 +305,45 @@ export async function sweepCodexSessionRetention(options: SessionRetentionSweepO
       }
       entries.push(entry);
     }
+
+    const retainedAfterProposedCleanup = candidates.filter(
+      (entry) => !(entry.eligible && (options.dryRun || entry.deleted === true)),
+    );
+    runsStillOverCap += Math.max(0, retainedAfterProposedCleanup.length - Math.floor(maxRunsPerAgent));
+    const retainedBytesAfterProposedCleanup = retainedAfterProposedCleanup.reduce(
+      (sum, entry) => sum + (entry.sizeBytes ?? 0),
+      0,
+    );
+    bytesStillOverCap += Math.max(0, retainedBytesAfterProposedCleanup - maxBytesPerAgent);
   }
 
   const eligible = entries.filter((entry) => entry.eligible);
   const deleted = eligible.filter((entry) => entry.deleted === true);
+  const inspectionFailures = entries.filter((entry) => entry.inspectionFailure === true);
+  const deletionErrors = eligible.filter((entry) => entry.deleted === false);
   return {
     policy,
     scanned: entries.length,
     eligible: eligible.length,
     deleted: deleted.length,
-    errors: eligible.filter(
-      (entry) => entry.deleted === false || entry.quarantineMarkerCleanupError !== undefined,
+    errors: deletionErrors.length + inspectionFailures.length + eligible.filter(
+      (entry) => entry.quarantineMarkerCleanupError !== undefined,
     ).length,
+    inspectionFailures: inspectionFailures.length,
     bytesEligible: eligible.reduce((sum, entry) => sum + (entry.sizeBytes ?? 0), 0),
     bytesDeleted: deleted.reduce((sum, entry) => sum + (entry.sizeBytes ?? 0), 0),
+    runsStillOverCap,
+    bytesStillOverCap,
     entries,
   };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const args = process.argv.slice(2);
-  const companyDir = args[args.indexOf("--company-dir") + 1];
+  const companyDirIndex = args.indexOf("--company-dir");
+  const companyDir = companyDirIndex >= 0 && !args[companyDirIndex + 1]?.startsWith("--")
+    ? args[companyDirIndex + 1]
+    : undefined;
   const dryRun = !args.includes("--delete");
   const numberArg = (name: string, fallback: number): number => {
     const index = args.indexOf(name);

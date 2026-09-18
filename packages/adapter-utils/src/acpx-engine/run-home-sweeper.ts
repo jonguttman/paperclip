@@ -48,6 +48,7 @@ interface RunHomeEntry {
   ageSecs: number;
   sizeBytes?: number;
   eligible: boolean;
+  inspectionFailure?: boolean;
   retentionProof?: "completion_manifest" | "legacy_nonempty_jsonl";
   quarantined?: boolean;
   quarantineMarkerInvalid?: boolean;
@@ -59,6 +60,7 @@ interface RunHomeEntry {
     terminalOwnershipVerified: true;
     zeroOpenHandlesVerified: true;
     rawJsonlCount?: number;
+    rawJsonlBytes?: number;
     zeroRawJsonlVerified: boolean;
     reviewCandidate: boolean;
     destructiveRecoveryEnabled: false;
@@ -292,7 +294,7 @@ async function validateRetentionProof(
 }
 
 async function inspectRawJsonlSet(runHomeDir: string): Promise<
-  { ok: true; count: number } | { ok: false; error: string }
+  { ok: true; count: number; bytes: number } | { ok: false; error: string }
 > {
   const sessionsDir = path.join(runHomeDir, "sessions");
   try {
@@ -300,9 +302,14 @@ async function inspectRawJsonlSet(runHomeDir: string): Promise<
     if (!stat.isDirectory() || stat.isSymbolicLink()) {
       return { ok: false, error: "raw sessions path is not a real directory" };
     }
-    return { ok: true, count: (await listJsonlArtifacts(sessionsDir)).size };
+    const artifacts = await listJsonlArtifacts(sessionsDir);
+    return {
+      ok: true,
+      count: artifacts.size,
+      bytes: [...artifacts.values()].reduce((sum, size) => sum + size, 0),
+    };
   } catch (err) {
-    if (isErrnoException(err, "ENOENT")) return { ok: true, count: 0 };
+    if (isErrnoException(err, "ENOENT")) return { ok: true, count: 0, bytes: 0 };
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
@@ -408,9 +415,22 @@ async function sweepAgentDir(
     let stat: Awaited<ReturnType<typeof fs.lstat>>;
     try {
       stat = await fs.lstat(runHomeDir);
-    } catch {
-      // The raw home is already gone. Remove the wrapper only when it is empty.
-      await fs.rmdir(runDir).catch(() => {});
+    } catch (err) {
+      // A missing home can be a live startup window. Report it without mutating
+      // even in delete mode; wrapper cleanup is not part of the raw-home gate.
+      entries.push({
+        agentId,
+        runId,
+        runHomeDir,
+        ageSecs: (now - runDirStat.mtimeMs) / 1000,
+        eligible: false,
+        ...(isErrnoException(err, "ENOENT")
+          ? { ineligibleReason: "raw home absent; wrapper retained" }
+          : {
+              inspectionFailure: true,
+              ineligibleReason: `run home could not be inspected: ${err instanceof Error ? err.message : String(err)}`,
+            }),
+      });
       continue;
     }
     if (!stat.isDirectory() || stat.isSymbolicLink()) {
@@ -420,6 +440,7 @@ async function sweepAgentDir(
         runHomeDir,
         ageSecs: (now - stat.mtimeMs) / 1000,
         eligible: false,
+        inspectionFailure: true,
         ineligibleReason: "run home is not a real directory",
       });
       continue;
@@ -436,6 +457,7 @@ async function sweepAgentDir(
     }
 
     if (!opts.paperclipApiBase || !opts.paperclipApiKey) {
+      entry.inspectionFailure = true;
       entry.ineligibleReason = "Paperclip API URL and key are required to verify terminal run status";
       entries.push(entry);
       continue;
@@ -449,6 +471,7 @@ async function sweepAgentDir(
       agentId,
     );
     if (!statusCheck.ok) {
+      entry.inspectionFailure = true;
       entry.ineligibleReason = `terminal run status could not be verified: ${statusCheck.error}`;
       entries.push(entry);
       continue;
@@ -459,6 +482,7 @@ async function sweepAgentDir(
       continue;
     }
     if (statusCheck.companyId !== companyId || statusCheck.agentId !== agentId) {
+      entry.inspectionFailure = true;
       entry.ineligibleReason = "run ownership does not match the company and agent directory";
       entries.push(entry);
       continue;
@@ -466,6 +490,7 @@ async function sweepAgentDir(
 
     const handleCheck = await (deps.checkOpenHandles ?? checkOpenHandles)(runHomeDir);
     if (!handleCheck.ok) {
+      entry.inspectionFailure = true;
       entry.ineligibleReason = `open-handle check failed: ${handleCheck.error}`;
       entries.push(entry);
       continue;
@@ -481,7 +506,17 @@ async function sweepAgentDir(
     // evaluated. A directory/symlink with this name is not the emitted shape;
     // treat it as an invalid marker path and fail closed as well.
     const quarantineMarker = path.join(runHomesParent, `${runId}.quarantine`);
-    const quarantineMarkerStat = await fs.lstat(quarantineMarker).catch(() => null);
+    let quarantineMarkerStat: Awaited<ReturnType<typeof fs.lstat>> | null = null;
+    try {
+      quarantineMarkerStat = await fs.lstat(quarantineMarker);
+    } catch (err) {
+      if (!isErrnoException(err, "ENOENT")) {
+        entry.inspectionFailure = true;
+        entry.ineligibleReason = `quarantine marker could not be inspected: ${err instanceof Error ? err.message : String(err)}`;
+        entries.push(entry);
+        continue;
+      }
+    }
     const hasQuarantine = quarantineMarkerStat?.isFile() === true && !quarantineMarkerStat.isSymbolicLink();
     entry.quarantined = hasQuarantine;
     entry.quarantineMarkerInvalid = quarantineMarkerStat !== null && !hasQuarantine;
@@ -491,6 +526,7 @@ async function sweepAgentDir(
       continue;
     }
     if (entry.quarantineMarkerInvalid) {
+      entry.inspectionFailure = true;
       entry.ineligibleReason = "quarantine marker path is not a real file";
       entries.push(entry);
       continue;
@@ -518,11 +554,15 @@ async function sweepAgentDir(
           terminalOwnershipVerified: true,
           zeroOpenHandlesVerified: true,
           ...(rawJsonl.ok ? { rawJsonlCount: rawJsonl.count } : {}),
+          ...(rawJsonl.ok ? { rawJsonlBytes: rawJsonl.bytes } : {}),
           zeroRawJsonlVerified,
           reviewCandidate: ageSatisfied && zeroRawJsonlVerified,
           destructiveRecoveryEnabled: false,
           ...(!rawJsonl.ok ? { inspectionError: rawJsonl.error } : {}),
         };
+        if (!rawJsonl.ok) entry.inspectionFailure = true;
+      } else {
+        entry.inspectionFailure = true;
       }
       entry.ineligibleReason = retentionProof.error;
       entries.push(entry);
@@ -554,6 +594,9 @@ export async function sweepRunHomes(opts: SweeperOptions, deps: SweeperDependenc
   eligible: number;
   deleted: number;
   errors: number;
+  inspectionFailures: number;
+  noCounterpartOrphans: number;
+  bytesAtRisk: number;
   totalBytesReclaimed: number;
   entries: RunHomeEntry[];
 }> {
@@ -562,7 +605,17 @@ export async function sweepRunHomes(opts: SweeperOptions, deps: SweeperDependenc
   }
   const companyDirStat = await fs.lstat(opts.companyDir).catch(() => null);
   if (!companyDirStat?.isDirectory() || companyDirStat.isSymbolicLink()) {
-    return { scanned: 0, eligible: 0, deleted: 0, errors: 0, totalBytesReclaimed: 0, entries: [] };
+    return {
+      scanned: 0,
+      eligible: 0,
+      deleted: 0,
+      errors: 0,
+      inspectionFailures: 0,
+      noCounterpartOrphans: 0,
+      bytesAtRisk: 0,
+      totalBytesReclaimed: 0,
+      entries: [],
+    };
   }
 
   // Validate every configured ancestor before inspecting descendants. lstat on
@@ -571,13 +624,33 @@ export async function sweepRunHomes(opts: SweeperOptions, deps: SweeperDependenc
   const acpEngineDir = path.join(opts.companyDir, "acp-engine");
   const acpEngineDirStat = await fs.lstat(acpEngineDir).catch(() => null);
   if (!acpEngineDirStat?.isDirectory() || acpEngineDirStat.isSymbolicLink()) {
-    return { scanned: 0, eligible: 0, deleted: 0, errors: 0, totalBytesReclaimed: 0, entries: [] };
+    return {
+      scanned: 0,
+      eligible: 0,
+      deleted: 0,
+      errors: 0,
+      inspectionFailures: 0,
+      noCounterpartOrphans: 0,
+      bytesAtRisk: 0,
+      totalBytesReclaimed: 0,
+      entries: [],
+    };
   }
 
   const agentsDir = path.join(acpEngineDir, "agents");
   const agentsDirStat = await fs.lstat(agentsDir).catch(() => null);
   if (!agentsDirStat?.isDirectory() || agentsDirStat.isSymbolicLink()) {
-    return { scanned: 0, eligible: 0, deleted: 0, errors: 0, totalBytesReclaimed: 0, entries: [] };
+    return {
+      scanned: 0,
+      eligible: 0,
+      deleted: 0,
+      errors: 0,
+      inspectionFailures: 0,
+      noCounterpartOrphans: 0,
+      bytesAtRisk: 0,
+      totalBytesReclaimed: 0,
+      entries: [],
+    };
   }
 
   const agentIds = await fs.readdir(agentsDir).catch(() => [] as string[]);
@@ -591,14 +664,25 @@ export async function sweepRunHomes(opts: SweeperOptions, deps: SweeperDependenc
 
   const eligible = allEntries.filter((e) => e.eligible);
   const deleted = eligible.filter((e) => e.deleted === true);
-  const errors = eligible.filter((e) => e.deleted === false);
+  const deletionErrors = eligible.filter((e) => e.deleted === false);
+  const inspectionFailures = allEntries.filter((e) => e.inspectionFailure === true);
+  const noCounterpartOrphans = allEntries.filter(
+    (e) => e.orphanClassification === "terminal_no_retention_counterpart",
+  );
+  const bytesAtRisk = noCounterpartOrphans.reduce(
+    (sum, entry) => sum + (entry.noCounterpartRecovery?.rawJsonlBytes ?? 0),
+    0,
+  );
   const totalBytesReclaimed = deleted.reduce((sum, e) => sum + (e.sizeBytes ?? 0), 0);
 
   return {
     scanned: allEntries.length,
     eligible: eligible.length,
     deleted: deleted.length,
-    errors: errors.length,
+    errors: deletionErrors.length + inspectionFailures.length,
+    inspectionFailures: inspectionFailures.length,
+    noCounterpartOrphans: noCounterpartOrphans.length,
+    bytesAtRisk,
     totalBytesReclaimed,
     entries: allEntries,
   };
@@ -607,7 +691,10 @@ export async function sweepRunHomes(opts: SweeperOptions, deps: SweeperDependenc
 // CLI entrypoint
 if (import.meta.url === `file://${process.argv[1]}`) {
   const args = process.argv.slice(2);
-  const companyDir = args[args.indexOf("--company-dir") + 1];
+  const companyDirIndex = args.indexOf("--company-dir");
+  const companyDir = companyDirIndex >= 0 && !args[companyDirIndex + 1]?.startsWith("--")
+    ? args[companyDirIndex + 1]
+    : undefined;
   const dryRun = !args.includes("--delete");
   const graceIdx = args.indexOf("--grace-hours");
   const graceHours = graceIdx >= 0 ? parseInt(args[graceIdx + 1] ?? "24", 10) : 24;
@@ -628,7 +715,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       process.stdout.write(JSON.stringify(result, null, 2) + "\n");
       const verb = dryRun ? "DRY-RUN" : "DELETED";
       process.stderr.write(
-        `[sweeper] ${verb}: scanned=${result.scanned} eligible=${result.eligible} deleted=${result.deleted} errors=${result.errors} reclaimed=${(result.totalBytesReclaimed / 1024 / 1024).toFixed(1)}MB\n`,
+        `[sweeper] ${verb}: scanned=${result.scanned} eligible=${result.eligible} deleted=${result.deleted} errors=${result.errors} inspectionFailures=${result.inspectionFailures} noCounterpartOrphans=${result.noCounterpartOrphans} bytesAtRisk=${result.bytesAtRisk} reclaimed=${(result.totalBytesReclaimed / 1024 / 1024).toFixed(1)}MB\n`,
       );
     })
     .catch((err) => {

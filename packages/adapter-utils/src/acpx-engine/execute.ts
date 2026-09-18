@@ -1153,7 +1153,9 @@ async function listCodexSessionJsonlFiles(input: {
   for (const entry of entries) {
     const relativePath = input.relativeDir ? path.join(input.relativeDir, entry.name) : entry.name;
     const absolutePath = path.join(input.dir, entry.name);
-    if (entry.isSymbolicLink()) continue;
+    if (entry.isSymbolicLink()) {
+      throw new Error("Codex session tree contains a symlink");
+    }
     if (entry.isDirectory()) {
       files.push(...await listCodexSessionJsonlFiles({
         root: input.root,
@@ -1395,7 +1397,7 @@ async function retainSanitizedCodexSessionsAfterClose(input: {
       eventType: "acpx.codex_run_home.quarantine",
       stream: "stderr",
       level: "error",
-      message: "Codex run home quarantined after sanitized session retention failed",
+      message: "Codex run home quarantined after best-effort-redacted session retention failed",
       payload: {
         schemaVersion: 1,
         runId: path.basename(runHomeParent),
@@ -1408,7 +1410,7 @@ async function retainSanitizedCodexSessionsAfterClose(input: {
     }).catch(() => {});
     await input.onLog(
       "stderr",
-      `[paperclip] INCIDENT: failed to retain sanitized ACPX Codex session JSONL; raw run home quarantined at "${runHome}"${quarantineMarkerError ? `, but marker creation at "${quarantineMarker}" also failed: ${quarantineMarkerError instanceof Error ? quarantineMarkerError.message : String(quarantineMarkerError)}` : ` with marker "${quarantineMarker}"`}: ${err instanceof Error ? err.message : String(err)}\n`,
+      `[paperclip] INCIDENT: failed to retain best-effort-redacted ACPX Codex session JSONL; raw run home quarantined at "${runHome}"${quarantineMarkerError ? `, but marker creation at "${quarantineMarker}" also failed: ${quarantineMarkerError instanceof Error ? quarantineMarkerError.message : String(quarantineMarkerError)}` : ` with marker "${quarantineMarker}"`}: ${err instanceof Error ? err.message : String(err)}\n`,
     );
     return;
   }
@@ -1455,7 +1457,7 @@ async function retainSanitizedCodexSessionsAfterClose(input: {
     }).catch(() => {});
     await input.onLog(
       "stderr",
-      `[paperclip] INCIDENT: sanitized ACPX Codex session retention succeeded, but raw run-home cleanup failed at "${runHome}"${quarantineMarkerError ? ` and marker creation at "${quarantineMarker}" also failed: ${quarantineMarkerError instanceof Error ? quarantineMarkerError.message : String(quarantineMarkerError)}` : `; quarantined with marker "${quarantineMarker}"`}: ${err instanceof Error ? err.message : String(err)}\n`,
+      `[paperclip] INCIDENT: best-effort-redacted ACPX Codex session retention succeeded, but raw run-home cleanup failed at "${runHome}"${quarantineMarkerError ? ` and marker creation at "${quarantineMarker}" also failed: ${quarantineMarkerError instanceof Error ? quarantineMarkerError.message : String(quarantineMarkerError)}` : `; quarantined with marker "${quarantineMarker}"`}: ${err instanceof Error ? err.message : String(err)}\n`,
     ).catch(() => {});
     return;
   }
@@ -5836,6 +5838,19 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // handle that already arrived must never race this step.
           const lateHandle = handshakeFence.seal();
           if (!slots.has("acp_runtime")) {
+            // A runtime-construction failure can leave remote bridges alive
+            // until the later stopTransport settlement step. Without a runtime
+            // handle there is no close proof yet, so preserve the raw home
+            // instead of deleting it one step before transport teardown.
+            if (prepared.processSessionBridge || prepared.paperclipBridge) {
+              await quarantineCodexRunHomeWithoutClose({
+                prepared,
+                onLog: ctx.onLog,
+                onEvent: ctx.onEvent,
+                reason: "runtime construction failed while transport was still active",
+              });
+              return;
+            }
             await retainSanitizedCodexSessionsAfterClose({
               prepared,
               onLog: ctx.onLog,

@@ -1477,7 +1477,7 @@ npx tsx packages/adapter-utils/src/acpx-engine/run-home-sweeper.ts \
 Set `PAPERCLIP_API_URL` and `PAPERCLIP_API_KEY` for both modes. The sweeper fails
 closed unless it can prove that the heartbeat run is terminal, the home has no
 open file handles, the home is older than the grace window, the API run ownership
-matches the company and agent directories, and a sanitized retention counterpart
+matches the company and agent directories, and a best-effort-redacted retention counterpart
 has proof of completion. New counterparts require a valid
 completion manifest. Legacy counterparts must contain a non-empty retained
 artifact for every JSONL file still present in the raw home. Partial, empty,
@@ -1495,6 +1495,11 @@ future operator-reviewed recovery could satisfy the stricter minimum age (at
 least seven days and at least twice the normal grace), terminal ownership, zero
 open handles, and zero raw JSONL requirements. This report never authorizes or
 performs no-counterpart deletion.
+The aggregate includes `inspectionFailures`, `noCounterpartOrphans`, and
+`bytesAtRisk`; the CLI summary prints all three so an unsafe or hard-loss entry
+cannot look like a clean `errors=0` run. An empty per-run wrapper with no `home`
+child is reported and retained because it can be a live startup window; dry-run
+never removes it.
 
 Review the JSON manifest before you add `--delete`. Keep the default 24-hour
 grace period unless the operator has approved a different recovery window.
@@ -1511,7 +1516,10 @@ The retention sweeper preserves a retained counterpart while any raw home for
 the run remains. Once the raw home is absent, approved cleanup removes a stale
 sibling quarantine marker with the retained run. Destructive cleanup is not
 scheduled. A one-off operator-reviewed invocation must supply both `--delete`
-and `--operator-approved`; `--delete` alone fails closed.
+and `--operator-approved`; `--delete` alone fails closed. Its manifest reports
+inspection failures plus `runsStillOverCap` and `bytesStillOverCap` when
+fail-closed raw-home or marker exclusions make the configured bound impossible
+to satisfy in that pass.
 
 ### GitHub identity for shared agents
 

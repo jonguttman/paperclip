@@ -159,6 +159,43 @@ describe("Codex session-retention lifecycle sweeper", () => {
       eligible: true,
     });
     expect(result.entries.find((entry) => entry.runId === "run-newest")?.eligible).toBe(false);
+    expect(result.runsStillOverCap).toBe(0);
+    expect(result.bytesStillOverCap).toBe(0);
+  });
+
+  it("reports the residual cap excess when protected counterparts alone exceed policy", async () => {
+    for (let index = 0; index < 5; index += 1) {
+      const runId = `run-${index}`;
+      await addRetention(runId, 5 - index, 1_000);
+      if (index < 3) {
+        await fs.mkdir(path.join(
+          companyDir,
+          "acp-engine",
+          "agents",
+          "agent-1",
+          "codex-run-homes",
+          runId,
+          "home",
+        ), { recursive: true });
+      }
+    }
+
+    const result = await sweepCodexSessionRetention({
+      companyDir,
+      dryRun: true,
+      nowMs,
+      retentionDays: 30,
+      maxRunsPerAgent: 2,
+      maxBytesPerAgent: 1_500,
+    });
+
+    expect(result.entries.filter((entry) => entry.eligible).map((entry) => entry.runId).sort()).toEqual([
+      "run-3",
+      "run-4",
+    ]);
+    expect(result.runsStillOverCap).toBe(1);
+    expect(result.bytesStillOverCap).toBeGreaterThanOrEqual(1_500);
+    expect(result.entries.every((entry) => entry.expiredByCountCap || entry.expiredByByteCap)).toBe(true);
   });
 
   it("fails closed on a quarantine-marker path that is not a real file", async () => {
@@ -187,6 +224,8 @@ describe("Codex session-retention lifecycle sweeper", () => {
       wouldDeleteQuarantineMarker: false,
       ineligibleReason: "quarantine marker path is not a real file",
     });
+    expect(result.inspectionFailures).toBe(1);
+    expect(result.errors).toBe(1);
     await expect(fs.stat(retainedRunDir)).resolves.toBeDefined();
     await expect(fs.stat(marker)).resolves.toBeDefined();
   });
