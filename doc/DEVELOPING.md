@@ -1507,11 +1507,12 @@ The aggregate includes `inspectionFailures`, `noCounterpartOrphans`, and
 `bytesAtRisk`. It also includes `orphanQuarantineMarkers`,
 `orphanQuarantineMarkerBytes`, and per-marker details when a sibling marker has
 neither a raw run wrapper nor a retained counterpart. Empty marker files are
-identified explicitly. The CLI summary prints the aggregates so an unsafe,
-hard-loss, or marker-only entry cannot look like a clean run. Marker-only records
-are never removed by this sweeper. An empty per-run wrapper with no `home` child
-is reported and retained because it can be a live startup window; dry-run never
-removes it.
+identified explicitly. Marker-only directories, symlinks, and paths that cannot
+be inspected are reported as inspection failures. The CLI summary prints the
+aggregates so an unsafe, hard-loss, or marker-only entry cannot look like a clean
+run. Marker-only records are never removed by this sweeper. An empty per-run
+wrapper with no `home` child is reported and retained because it can be a live
+startup window; dry-run never removes it.
 
 Review the JSON manifest before you add `--delete`. Keep the default 24-hour
 grace period unless the operator has approved a different recovery window.

@@ -200,6 +200,44 @@ describe("run-home sweeper", () => {
       await expect(fs.stat(marker)).resolves.toBeDefined();
     });
 
+    it("reports invalid marker-only directories and symlinks as inspection failures", async () => {
+      const runHomesRoot = path.join(
+        companyDir,
+        "acp-engine",
+        "agents",
+        "agent-1",
+        "codex-run-homes",
+      );
+      const markerDirectory = path.join(runHomesRoot, "run-marker-dir.quarantine");
+      const markerSymlink = path.join(runHomesRoot, "run-marker-link.quarantine");
+      const externalMarker = path.join(companyDir, "external-marker");
+      await fs.mkdir(markerDirectory, { recursive: true });
+      await fs.writeFile(externalMarker, "{}\n", "utf8");
+      await fs.symlink(externalMarker, markerSymlink);
+
+      const result = await sweep({ companyDir, dryRun: false, graceHours: 24 });
+
+      expect(result.orphanQuarantineMarkers).toBe(2);
+      expect(result.inspectionFailures).toBe(2);
+      expect(result.errors).toBe(2);
+      expect(result.orphanQuarantineMarkerEntries).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          runId: "run-marker-dir",
+          quarantineMarkerInvalid: true,
+          inspectionFailure: true,
+          reason: "quarantine marker path is not a real file",
+        }),
+        expect.objectContaining({
+          runId: "run-marker-link",
+          quarantineMarkerInvalid: true,
+          inspectionFailure: true,
+          reason: "quarantine marker path is not a real file",
+        }),
+      ]));
+      await expect(fs.stat(markerDirectory)).resolves.toBeDefined();
+      await expect(fs.lstat(markerSymlink)).resolves.toBeDefined();
+    });
+
     it("marks ineligible homes in the manifest with a reason", async () => {
       // Home within grace window (only 1 hour old)
       await buildRunHome({

@@ -49,9 +49,11 @@ aggregate fields and CLI summary values. Empty run wrappers are reported but
 never mutated by the sweeper because they can be a live startup window.
 Sibling quarantine files with neither a raw run wrapper nor a retained
 counterpart are also listed separately with their age, byte size, and empty-file
-state. They are not automatically deleted. Local Codex runtimes are closed
-before retention and are never placed in the warm-runtime cache; a regression
-test pins that lifecycle constraint.
+state. Marker-only directories, symlinks, and inspection failures are listed as
+operator-visible inspection failures instead of disappearing from the manifest.
+They are not automatically deleted. Local Codex runtimes are closed before
+retention and are never placed in the warm-runtime cache; a regression test pins
+that lifecycle constraint.
 
 ## Risks
 

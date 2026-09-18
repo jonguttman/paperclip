@@ -75,11 +75,16 @@ interface OrphanQuarantineMarkerEntry {
   agentId: string;
   runId: string;
   markerPath: string;
-  ageSecs: number;
-  markerBytes: number;
-  emptyMarker: boolean;
+  ageSecs?: number;
+  markerBytes?: number;
+  emptyMarker?: boolean;
+  quarantineMarkerInvalid?: boolean;
   inspectionFailure?: boolean;
-  reason: "run and retained-session counterparts are absent" | "counterpart inspection failed";
+  reason:
+    | "run and retained-session counterparts are absent"
+    | "quarantine marker path is not a real file"
+    | "quarantine marker could not be inspected"
+    | "counterpart inspection failed";
   error?: string;
 }
 
@@ -431,8 +436,6 @@ async function sweepAgentDir(
     if (!runId) continue;
     const markerPath = path.join(runHomesParent, markerName);
     if (!isPathBelow(runHomesParent, markerPath)) continue;
-    const markerStat = await fs.lstat(markerPath).catch(() => null);
-    if (!markerStat?.isFile() || markerStat.isSymbolicLink()) continue;
 
     const inspectCounterpart = async (candidate: string): Promise<
       { exists: boolean } | { exists: false; error: string }
@@ -451,14 +454,37 @@ async function sweepAgentDir(
     const counterpartError =
       ("error" in runCounterpart ? runCounterpart.error : undefined) ??
       ("error" in retainedCounterpart ? retainedCounterpart.error : undefined);
+
+    let markerStat: Awaited<ReturnType<typeof fs.lstat>>;
+    try {
+      markerStat = await fs.lstat(markerPath);
+    } catch (err) {
+      orphanQuarantineMarkerEntries.push({
+        agentId,
+        runId,
+        markerPath,
+        inspectionFailure: true,
+        reason: "quarantine marker could not be inspected",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      continue;
+    }
+    const validMarkerFile = markerStat.isFile() && !markerStat.isSymbolicLink();
     orphanQuarantineMarkerEntries.push({
       agentId,
       runId,
       markerPath,
       ageSecs: (now - markerStat.mtimeMs) / 1000,
       markerBytes: markerStat.size,
-      emptyMarker: markerStat.size === 0,
-      ...(counterpartError
+      ...(validMarkerFile ? { emptyMarker: markerStat.size === 0 } : {}),
+      ...(!validMarkerFile
+        ? {
+            quarantineMarkerInvalid: true,
+            inspectionFailure: true,
+            reason: "quarantine marker path is not a real file" as const,
+            ...(counterpartError ? { error: counterpartError } : {}),
+          }
+        : counterpartError
         ? {
             inspectionFailure: true,
             reason: "counterpart inspection failed" as const,
@@ -756,7 +782,7 @@ export async function sweepRunHomes(opts: SweeperOptions, deps: SweeperDependenc
   );
   const totalBytesReclaimed = deleted.reduce((sum, e) => sum + (e.sizeBytes ?? 0), 0);
   const orphanQuarantineMarkerBytes = allOrphanQuarantineMarkerEntries.reduce(
-    (sum, entry) => sum + entry.markerBytes,
+    (sum, entry) => sum + (entry.markerBytes ?? 0),
     0,
   );
 
