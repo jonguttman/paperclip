@@ -1079,6 +1079,10 @@ async function prepareRunIsolatedCodexHome(input: {
 }): Promise<void> {
   await fs.rm(input.runHome, { recursive: true, force: true });
   await fs.mkdir(input.runHome, { recursive: true, mode: 0o700 });
+  // Publish ownership as soon as this call has created the run home. Every
+  // later seed/copy/chmod/log failure must reach the outer build rollback so
+  // the new directory is either removed or durably quarantined.
+  input.onPrepared?.();
 
   const authJson = path.join(input.sourceHome, "auth.json");
   if (await pathExists(authJson)) await ensureSymlink(path.join(input.runHome, "auth.json"), authJson);
@@ -1089,10 +1093,6 @@ async function prepareRunIsolatedCodexHome(input: {
   }
 
   await chmodPrivateTree(input.runHome);
-  // Publish ownership before the informational log. A throwing log sink is a
-  // build failure too, and the outer rollback must still know which home was
-  // created so it cannot strand an untracked raw directory.
-  input.onPrepared?.();
   await input.onLog(
     "stdout",
     `[paperclip] Using run-isolated ACPX Codex home "${input.runHome}" (seeded from "${input.sourceHome}").\n`,

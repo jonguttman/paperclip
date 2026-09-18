@@ -2745,7 +2745,9 @@ describe("shared ACPX engine runtime behavior", () => {
     const sourceCodexHome = path.join(root, "source-codex-home");
     const runId = "run-build-fail-unused";
     await fs.mkdir(sourceCodexHome, { recursive: true });
-    await fs.writeFile(path.join(sourceCodexHome, "config.toml"), "model_provider = \"openai\"\n", "utf8");
+    // A directory at a config-file source forces seeding to fail after the run
+    // home is created, before preparation and its informational log complete.
+    await fs.mkdir(path.join(sourceCodexHome, "config.toml"));
 
     const execute = createAcpxEngineExecutor({ adapterType: "codex_local" });
     await expect(execute({
@@ -2754,11 +2756,9 @@ describe("shared ACPX engine runtime behavior", () => {
       runtime: {},
       config: { agent: "codex", stateDir, env: { CODEX_HOME: sourceCodexHome } },
       context: {},
-      onLog: async (_stream: "stdout" | "stderr", text: string) => {
-        if (text.includes("Using run-isolated ACPX Codex home")) throw new Error("startup log sink failed");
-      },
+      onLog: async () => {},
       onMeta: async () => {},
-    } as never)).rejects.toThrow("startup log sink failed");
+    } as never)).rejects.toThrow();
 
     await expect(fs.stat(path.join(stateDir, "codex-run-homes", runId, "home"))).rejects.toThrow();
     await expect(fs.stat(path.join(stateDir, "codex-session-retention", runId))).rejects.toThrow();
@@ -2772,7 +2772,7 @@ describe("shared ACPX engine runtime behavior", () => {
     const runId = "run-build-fail-cleanup-fail";
     const events: Array<{ eventType: string; payload?: Record<string, unknown> }> = [];
     await fs.mkdir(sourceCodexHome, { recursive: true });
-    await fs.writeFile(path.join(sourceCodexHome, "config.toml"), "model_provider = \"openai\"\n", "utf8");
+    await fs.mkdir(path.join(sourceCodexHome, "config.toml"));
 
     const execute = createAcpxEngineExecutor({
       adapterType: "codex_local",
@@ -2786,14 +2786,12 @@ describe("shared ACPX engine runtime behavior", () => {
       runtime: {},
       config: { agent: "codex", stateDir, env: { CODEX_HOME: sourceCodexHome } },
       context: {},
-      onLog: async (_stream: "stdout" | "stderr", text: string) => {
-        if (text.includes("Using run-isolated ACPX Codex home")) throw new Error("startup log sink failed");
-      },
+      onLog: async () => {},
       onEvent: async (event: { eventType: string; payload?: Record<string, unknown> }) => {
         events.push(event);
       },
       onMeta: async () => {},
-    } as never)).rejects.toThrow("startup log sink failed");
+    } as never)).rejects.toThrow();
 
     await expect(fs.stat(path.join(stateDir, "codex-run-homes", runId, "home"))).resolves.toBeDefined();
     const marker = JSON.parse(await fs.readFile(

@@ -123,4 +123,71 @@ describe("Codex session-retention lifecycle sweeper", () => {
     expect(oldest).toMatchObject({ expiredByCountCap: true, expiredByByteCap: true, eligible: true });
     expect(result.entries.find((entry) => entry.runId === "run-newest")?.eligible).toBe(false);
   });
+
+  it("continues cap eviction past a protected raw-home counterpart", async () => {
+    await addRetention("run-oldest-protected", 3, 80);
+    await addRetention("run-middle", 2, 80);
+    await addRetention("run-newest", 1, 80);
+    await fs.mkdir(path.join(
+      companyDir,
+      "acp-engine",
+      "agents",
+      "agent-1",
+      "codex-run-homes",
+      "run-oldest-protected",
+      "home",
+    ), { recursive: true });
+
+    const result = await sweepCodexSessionRetention({
+      companyDir,
+      dryRun: true,
+      nowMs,
+      retentionDays: 30,
+      maxRunsPerAgent: 2,
+      maxBytesPerAgent: 180,
+    });
+
+    expect(result.entries.find((entry) => entry.runId === "run-oldest-protected")).toMatchObject({
+      expiredByCountCap: true,
+      expiredByByteCap: true,
+      eligible: false,
+      rawRunHomePresent: true,
+    });
+    expect(result.entries.find((entry) => entry.runId === "run-middle")).toMatchObject({
+      expiredByCountCap: true,
+      expiredByByteCap: true,
+      eligible: true,
+    });
+    expect(result.entries.find((entry) => entry.runId === "run-newest")?.eligible).toBe(false);
+  });
+
+  it("fails closed on a quarantine-marker path that is not a real file", async () => {
+    const retainedRunDir = await addRetention("run-invalid-marker", 60);
+    const marker = path.join(
+      companyDir,
+      "acp-engine",
+      "agents",
+      "agent-1",
+      "codex-run-homes",
+      "run-invalid-marker.quarantine",
+    );
+    await fs.mkdir(marker, { recursive: true });
+
+    const result = await sweepCodexSessionRetention({
+      companyDir,
+      dryRun: false,
+      operatorApproved: true,
+      nowMs,
+    });
+
+    expect(result.entries[0]).toMatchObject({
+      eligible: false,
+      quarantineMarkerPresent: false,
+      quarantineMarkerInvalid: true,
+      wouldDeleteQuarantineMarker: false,
+      ineligibleReason: "quarantine marker path is not a real file",
+    });
+    await expect(fs.stat(retainedRunDir)).resolves.toBeDefined();
+    await expect(fs.stat(marker)).resolves.toBeDefined();
+  });
 });

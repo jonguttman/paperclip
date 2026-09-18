@@ -10,7 +10,7 @@
  *   1. The Paperclip heartbeat run is terminal
  *   2. Zero open file handles on the directory tree   (lsof check)
  *   3. mtime of the run-home dir is >=24h ago
- *   4. A sanitized session counterpart has a valid completion manifest, or a
+ *   4. A best-effort-redacted session counterpart has a valid completion manifest, or a
  *      legacy counterpart contains a non-empty JSONL artifact
  *
  * Invariant 4 ensures we never silently discard a home whose session data was

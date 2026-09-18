@@ -37,6 +37,7 @@ export interface SessionRetentionEntry {
   eligible: boolean;
   rawRunHomePresent: boolean;
   quarantineMarkerPresent: boolean;
+  quarantineMarkerInvalid?: boolean;
   wouldDeleteQuarantineMarker: boolean;
   ineligibleReason?: string;
   deleted?: boolean;
@@ -176,9 +177,11 @@ export async function sweepCodexSessionRetention(options: SessionRetentionSweepO
       const rawRunHomePresent = runHomesRootUnsafe
         ? false
         : await fs.lstat(rawRunHome).then(() => true, () => false);
-      const quarantineMarkerPresent = runHomesRootUnsafe
-        ? false
-        : await fs.lstat(marker).then(() => true, () => false);
+      const markerStat = runHomesRootUnsafe
+        ? null
+        : await fs.lstat(marker).catch(() => null);
+      const quarantineMarkerPresent = markerStat?.isFile() === true && !markerStat.isSymbolicLink();
+      const quarantineMarkerInvalid = markerStat !== null && !quarantineMarkerPresent;
       candidates.push({
         agentId,
         runId,
@@ -192,21 +195,36 @@ export async function sweepCodexSessionRetention(options: SessionRetentionSweepO
         eligible: false,
         rawRunHomePresent,
         quarantineMarkerPresent,
+        quarantineMarkerInvalid,
         wouldDeleteQuarantineMarker: quarantineMarkerPresent && !rawRunHomePresent,
-        ...(runHomesRootUnsafe ? { ineligibleReason: "Codex run-home root is not a real directory" } : {}),
+        ...(runHomesRootUnsafe
+          ? { ineligibleReason: "Codex run-home root is not a real directory" }
+          : quarantineMarkerInvalid
+            ? { ineligibleReason: "quarantine marker path is not a real file" }
+            : {}),
       });
     }
 
-    const inspectable = candidates
-      .filter((entry) => entry.sizeBytes !== undefined)
+    const oldestFirst = [...candidates]
       .sort((a, b) => a.retainedAtMs - b.retainedAtMs || a.runId.localeCompare(b.runId));
-    const excessCount = Math.max(0, inspectable.length - Math.floor(maxRunsPerAgent));
-    for (let index = 0; index < excessCount; index += 1) inspectable[index]!.expiredByCountCap = true;
-    let totalBytes = inspectable.reduce((sum, entry) => sum + (entry.sizeBytes ?? 0), 0);
+    const inspectable = oldestFirst
+      .filter((entry) => entry.sizeBytes !== undefined);
+    const canRemoveForCap = (entry: SessionRetentionEntry): boolean =>
+      entry.ineligibleReason === undefined && !entry.rawRunHomePresent;
+    let projectedCount = candidates.length;
+    for (const entry of oldestFirst) {
+      if (projectedCount <= Math.floor(maxRunsPerAgent)) break;
+      entry.expiredByCountCap = true;
+      // Protected or uninspectable entries still count against the cap. Keep
+      // walking so the dry run proposes enough removable entries to restore
+      // the bound as far as the fail-closed exclusions allow.
+      if (canRemoveForCap(entry)) projectedCount -= 1;
+    }
+    let projectedBytes = inspectable.reduce((sum, entry) => sum + (entry.sizeBytes ?? 0), 0);
     for (const entry of inspectable) {
-      if (totalBytes <= maxBytesPerAgent) break;
+      if (projectedBytes <= maxBytesPerAgent) break;
       entry.expiredByByteCap = true;
-      totalBytes -= entry.sizeBytes ?? 0;
+      if (canRemoveForCap(entry)) projectedBytes -= entry.sizeBytes ?? 0;
     }
 
     for (const entry of candidates) {
