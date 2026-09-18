@@ -3,6 +3,7 @@ import {
   REDACTED_COMMAND_TEXT_VALUE,
   redactCommandText,
   redactDiagnosticText,
+  redactDiagnosticTextWithStats,
 } from "./command-redaction.js";
 
 describe("redactDiagnosticText", () => {
@@ -92,6 +93,58 @@ second-line\" status=401`;
     const output = redactDiagnosticText(input);
     expect(output).not.toContain("MARKERBACKSLASH_B");
     expect(output).toContain(REDACTED_COMMAND_TEXT_VALUE);
+  });
+
+  it("preserves dotted identifiers that do not have a decodable JWT algorithm header", () => {
+    const inputs = [
+      "run_home_sweeper.test_case.baseline",
+      "com_example.my_service.api_handler",
+      "see file execute_test.snapshot.baseline for details",
+      "2026-09-17.rollout-abc.jsonl_backup",
+    ];
+    for (const input of inputs) expect(redactDiagnosticText(input)).toBe(input);
+  });
+
+  it("redacts a compact JWT only when its header decodes to an algorithm object", () => {
+    const jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlMTIz";
+    expect(redactDiagnosticText(jwt)).toBe(REDACTED_COMMAND_TEXT_VALUE);
+  });
+
+  it("redacts standard cloud, datastore, private-key, and Stripe credential forms", () => {
+    const awsAccessKey = "AKIAIOSFODNN7EXAMPLE";
+    const awsSecretKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    const stripeKey = `sk_live_${"a1B2".repeat(6)}`;
+    const dsn = "postgres://admin:Sup3rS3cret@db.internal:5432/prod";
+    const pem = [
+      "-----BEGIN RSA PRIVATE KEY-----",
+      "ZmFrZS1rZXktbWF0ZXJpYWw=",
+      "-----END RSA PRIVATE KEY-----",
+    ].join("\n");
+    const input = [
+      awsAccessKey,
+      awsSecretKey,
+      stripeKey,
+      dsn,
+      pem,
+    ].join("\n");
+    const output = redactDiagnosticText(input);
+
+    expect(output).not.toContain(awsAccessKey);
+    expect(output).not.toContain(awsSecretKey);
+    expect(output).not.toContain(stripeKey);
+    expect(output).not.toContain("Sup3rS3cret");
+    expect(output).not.toContain("ZmFrZS1rZXktbWF0ZXJpYWw=");
+  });
+
+  it("reports the number of introduced redaction markers", () => {
+    const awsAccessKey = "AKIAIOSFODNN7EXAMPLE";
+    const result = redactDiagnosticTextWithStats(
+      `Authorization: Bearer opaque-token\naccess=${awsAccessKey}`,
+    );
+
+    expect(result.text).not.toContain("opaque-token");
+    expect(result.text).not.toContain(awsAccessKey);
+    expect(result.redactionCount).toBe(2);
   });
 });
 

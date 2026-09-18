@@ -156,7 +156,7 @@ import {
   type StartupStepMeasureOptions,
   type StartupTraceContext,
 } from "./startup-timing.js";
-import { redactDiagnosticText } from "../command-redaction.js";
+import { redactDiagnosticTextWithStats } from "../command-redaction.js";
 
 const defaultModuleDir = path.dirname(fileURLToPath(import.meta.url));
 const PAPERCLIP_MANAGED_CODEX_SKILLS_MANIFEST = ".paperclip-managed-skills.json";
@@ -1190,6 +1190,8 @@ async function retainSanitizedCodexSessionJsonl(input: {
   await fs.mkdir(input.retention.retainedSessionsDir, { recursive: true, mode: 0o700 });
 
   let retainedSourceBytes = 0;
+  let totalRedactionHits = 0;
+  const redactionHitsByFile: Array<{ sessionFile: string; count: number }> = [];
   for (const relativePath of sessionFiles) {
     const source = path.join(sessionsDir, relativePath);
     const target = path.join(input.retention.retainedSessionsDir, relativePath);
@@ -1200,9 +1202,15 @@ async function retainSanitizedCodexSessionJsonl(input: {
         `Codex session JSONL set exceeds the ${MAX_CODEX_RETAINED_BYTES_PER_RUN}-byte per-run retention limit`,
       );
     }
+    const redacted = redactDiagnosticTextWithStats(bounded.text);
+    totalRedactionHits += redacted.redactionCount;
+    redactionHitsByFile.push({
+      sessionFile: relativePath,
+      count: redacted.redactionCount,
+    });
     await writeFileAtomically({
       target,
-      contents: redactDiagnosticText(bounded.text),
+      contents: redacted.text,
       mode: 0o600,
     });
   }
@@ -1219,6 +1227,8 @@ async function retainSanitizedCodexSessionJsonl(input: {
       sessionFiles,
       sourceBytes: retainedSourceBytes,
       redaction: "best_effort_diagnostic_redactor",
+      redactionHitCount: totalRedactionHits,
+      redactionHitsByFile,
       bounds: {
         maxFileBytes: MAX_CODEX_SESSION_JSONL_BYTES,
         maxRunBytes: MAX_CODEX_RETAINED_BYTES_PER_RUN,

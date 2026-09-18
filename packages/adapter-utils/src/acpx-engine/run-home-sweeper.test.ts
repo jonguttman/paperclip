@@ -157,6 +157,49 @@ describe("run-home sweeper", () => {
       await expect(fs.stat(runDir)).resolves.toBeDefined();
     });
 
+    it("reports an orphan quarantine marker without deleting it in delete mode", async () => {
+      const marker = path.join(
+        companyDir,
+        "acp-engine",
+        "agents",
+        "agent-1",
+        "codex-run-homes",
+        "run-marker-only.quarantine",
+      );
+      await fs.mkdir(path.dirname(marker), { recursive: true });
+      await fs.writeFile(marker, "", "utf8");
+
+      const result = await sweep({ companyDir, dryRun: false, graceHours: 24 });
+
+      expect(result.orphanQuarantineMarkers).toBe(1);
+      expect(result.orphanQuarantineMarkerBytes).toBe(0);
+      expect(result.orphanQuarantineMarkerEntries).toEqual([
+        expect.objectContaining({
+          agentId: "agent-1",
+          runId: "run-marker-only",
+          markerPath: marker,
+          markerBytes: 0,
+          emptyMarker: true,
+          reason: "run and retained-session counterparts are absent",
+        }),
+      ]);
+      await expect(fs.stat(marker)).resolves.toBeDefined();
+    });
+
+    it("does not classify a marker as orphaned while its retained counterpart exists", async () => {
+      const agentDir = path.join(companyDir, "acp-engine", "agents", "agent-1");
+      const marker = path.join(agentDir, "codex-run-homes", "run-retained.quarantine");
+      await fs.mkdir(path.dirname(marker), { recursive: true });
+      await fs.writeFile(marker, "{}\n", "utf8");
+      await fs.mkdir(path.join(agentDir, "codex-session-retention", "run-retained"), { recursive: true });
+
+      const result = await sweep({ companyDir, dryRun: true, graceHours: 24 });
+
+      expect(result.orphanQuarantineMarkers).toBe(0);
+      expect(result.orphanQuarantineMarkerEntries).toEqual([]);
+      await expect(fs.stat(marker)).resolves.toBeDefined();
+    });
+
     it("marks ineligible homes in the manifest with a reason", async () => {
       // Home within grace window (only 1 hour old)
       await buildRunHome({

@@ -2600,12 +2600,14 @@ describe("shared ACPX engine runtime behavior", () => {
       "session.jsonl",
     );
     const closeOrder: string[] = [];
+    const warmHandles = new Map();
 
     await fs.mkdir(sourceCodexHome, { recursive: true });
     await fs.writeFile(path.join(sourceCodexHome, "config.toml"), "model_provider = \"openai\"\n", "utf8");
 
     const execute = createAcpxEngineExecutor({
       adapterType: "codex_local",
+      warmHandles,
       createRuntime: () => ({
         ensureSession: async () => ({
           backendSessionId: "backend-session",
@@ -2656,6 +2658,9 @@ describe("shared ACPX engine runtime behavior", () => {
 
     expect(result.exitCode).toBe(0);
     expect(closeOrder).toEqual(["close"]);
+    // Retention reads the run-isolated home only after runtime close. A Codex
+    // runtime that owns such a home must never survive in the warm cache.
+    expect(warmHandles.size).toBe(0);
 
     const retainedFile = path.join(
       stateDir,
@@ -2680,6 +2685,18 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(logs.some((entry) => entry.text.includes("Deleted raw Codex run home"))).toBe(true);
     expect(logs.every((entry) => !entry.text.includes("INCIDENT"))).toBe(true);
     expect(logs.some((entry) => entry.text.includes("Retained 1 best-effort-redacted ACPX Codex session JSONL"))).toBe(true);
+    const manifest = JSON.parse(await fs.readFile(
+      path.join(stateDir, "codex-session-retention", runId, "retention-complete.json"),
+      "utf8",
+    )) as {
+      redactionHitCount: number;
+      redactionHitsByFile: Array<{ sessionFile: string; count: number }>;
+    };
+    expect(manifest.redactionHitCount).toBeGreaterThan(0);
+    expect(manifest.redactionHitsByFile).toEqual([{
+      sessionFile: path.join("2026", "08", "session.jsonl"),
+      count: manifest.redactionHitCount,
+    }]);
   });
 
   it("removes a closed raw run home when Codex created no sessions directory", async () => {

@@ -1448,9 +1448,12 @@ unknown credential format was removed. Retention reads each source through an
 8 MiB fixed caller-side bound and caps the source set at 32 MiB per run before
 calling the synchronous diagnostic redactor. Oversize, invalid-UTF-8, or
 unreadable input fails closed: partial retained output is removed and the raw
-home is quarantined. Paperclip removes the raw run home only after bounded
-retention succeeds. Successful retention writes an atomic
-`retention-complete.json` manifest, including for valid zero-session runs. If
+home is quarantined. The redactor requires a structurally decodable JWT header
+instead of treating every dotted identifier as a credential, and covers common
+AWS, inline datastore DSN, PEM private-key, and Stripe key forms. Paperclip
+removes the raw run home only after bounded retention succeeds. Successful
+retention writes an atomic `retention-complete.json` manifest with total and
+per-file redaction-rule hit counts, including for valid zero-session runs. If
 retention or runtime close fails, Paperclip removes partial retained output,
 preserves the home, and writes a sibling `<run-id>.quarantine` marker. If raw-home
 deletion fails after retention succeeds, Paperclip preserves both the durable
@@ -1466,6 +1469,11 @@ error level. Its version-1 payload includes `runId`, `runHome`,
 startup removes the provably unused home; cleanup failure or any attempted
 transport startup quarantines it instead. Consumers should alert on the structured event;
 the sibling marker remains the durable filesystem audit record.
+The 8 MiB limit is intentionally fail-closed rather than truncating retained
+evidence. Monitor `sanitized_session_retention_failed` events and markers to
+measure oversize frequency before proposing a higher limit or streaming design.
+Local Codex runtimes close before retention and are not saved to the warm-runtime
+cache.
 
 The orphan sweeper is dry-run only unless `--delete` is present:
 
@@ -1496,10 +1504,14 @@ least seven days and at least twice the normal grace), terminal ownership, zero
 open handles, and zero raw JSONL requirements. This report never authorizes or
 performs no-counterpart deletion.
 The aggregate includes `inspectionFailures`, `noCounterpartOrphans`, and
-`bytesAtRisk`; the CLI summary prints all three so an unsafe or hard-loss entry
-cannot look like a clean `errors=0` run. An empty per-run wrapper with no `home`
-child is reported and retained because it can be a live startup window; dry-run
-never removes it.
+`bytesAtRisk`. It also includes `orphanQuarantineMarkers`,
+`orphanQuarantineMarkerBytes`, and per-marker details when a sibling marker has
+neither a raw run wrapper nor a retained counterpart. Empty marker files are
+identified explicitly. The CLI summary prints the aggregates so an unsafe,
+hard-loss, or marker-only entry cannot look like a clean run. Marker-only records
+are never removed by this sweeper. An empty per-run wrapper with no `home` child
+is reported and retained because it can be a live startup window; dry-run never
+removes it.
 
 Review the JSON manifest before you add `--delete`. Keep the default 24-hour
 grace period unless the operator has approved a different recovery window.

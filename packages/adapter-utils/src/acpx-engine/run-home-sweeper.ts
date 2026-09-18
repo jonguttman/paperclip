@@ -71,6 +71,18 @@ interface RunHomeEntry {
   error?: string;
 }
 
+interface OrphanQuarantineMarkerEntry {
+  agentId: string;
+  runId: string;
+  markerPath: string;
+  ageSecs: number;
+  markerBytes: number;
+  emptyMarker: boolean;
+  inspectionFailure?: boolean;
+  reason: "run and retained-session counterparts are absent" | "counterpart inspection failed";
+  error?: string;
+}
+
 const RETENTION_MANIFEST_NAME = "retention-complete.json";
 const MINIMUM_GRACE_HOURS = 24;
 const MINIMUM_NO_COUNTERPART_RECOVERY_HOURS = 24 * 7;
@@ -382,14 +394,23 @@ async function sweepAgentDir(
   agentsDir: string,
   opts: SweeperOptions,
   deps: SweeperDependencies,
-): Promise<RunHomeEntry[]> {
-  if (!isPathBelow(agentsDir, agentDir)) return [];
+): Promise<{
+  entries: RunHomeEntry[];
+  orphanQuarantineMarkerEntries: OrphanQuarantineMarkerEntry[];
+}> {
+  if (!isPathBelow(agentsDir, agentDir)) {
+    return { entries: [], orphanQuarantineMarkerEntries: [] };
+  }
   const agentStat = await fs.lstat(agentDir).catch(() => null);
-  if (!agentStat?.isDirectory() || agentStat.isSymbolicLink()) return [];
+  if (!agentStat?.isDirectory() || agentStat.isSymbolicLink()) {
+    return { entries: [], orphanQuarantineMarkerEntries: [] };
+  }
 
   const runHomesParent = path.join(agentDir, "codex-run-homes");
   const runHomesParentStat = await fs.lstat(runHomesParent).catch(() => null);
-  if (!runHomesParentStat?.isDirectory() || runHomesParentStat.isSymbolicLink()) return [];
+  if (!runHomesParentStat?.isDirectory() || runHomesParentStat.isSymbolicLink()) {
+    return { entries: [], orphanQuarantineMarkerEntries: [] };
+  }
 
   const retentionParent = path.join(agentDir, "codex-session-retention");
   const companyId = path.basename(path.resolve(opts.companyDir));
@@ -401,7 +422,50 @@ async function sweepAgentDir(
   try {
     runIds = await fs.readdir(runHomesParent);
   } catch {
-    return [];
+    return { entries: [], orphanQuarantineMarkerEntries: [] };
+  }
+
+  const orphanQuarantineMarkerEntries: OrphanQuarantineMarkerEntry[] = [];
+  for (const markerName of runIds.filter((name) => name.endsWith(".quarantine"))) {
+    const runId = markerName.slice(0, -".quarantine".length);
+    if (!runId) continue;
+    const markerPath = path.join(runHomesParent, markerName);
+    if (!isPathBelow(runHomesParent, markerPath)) continue;
+    const markerStat = await fs.lstat(markerPath).catch(() => null);
+    if (!markerStat?.isFile() || markerStat.isSymbolicLink()) continue;
+
+    const inspectCounterpart = async (candidate: string): Promise<
+      { exists: boolean } | { exists: false; error: string }
+    > => {
+      try {
+        await fs.lstat(candidate);
+        return { exists: true };
+      } catch (err) {
+        if (isErrnoException(err, "ENOENT")) return { exists: false };
+        return { exists: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    };
+    const runCounterpart = await inspectCounterpart(path.join(runHomesParent, runId));
+    const retainedCounterpart = await inspectCounterpart(path.join(retentionParent, runId));
+    if (runCounterpart.exists || retainedCounterpart.exists) continue;
+    const counterpartError =
+      ("error" in runCounterpart ? runCounterpart.error : undefined) ??
+      ("error" in retainedCounterpart ? retainedCounterpart.error : undefined);
+    orphanQuarantineMarkerEntries.push({
+      agentId,
+      runId,
+      markerPath,
+      ageSecs: (now - markerStat.mtimeMs) / 1000,
+      markerBytes: markerStat.size,
+      emptyMarker: markerStat.size === 0,
+      ...(counterpartError
+        ? {
+            inspectionFailure: true,
+            reason: "counterpart inspection failed" as const,
+            error: counterpartError,
+          }
+        : { reason: "run and retained-session counterparts are absent" as const }),
+    });
   }
 
   for (const runId of runIds) {
@@ -586,7 +650,7 @@ async function sweepAgentDir(
     entries.push(entry);
   }
 
-  return entries;
+  return { entries, orphanQuarantineMarkerEntries };
 }
 
 export async function sweepRunHomes(opts: SweeperOptions, deps: SweeperDependencies = {}): Promise<{
@@ -597,8 +661,11 @@ export async function sweepRunHomes(opts: SweeperOptions, deps: SweeperDependenc
   inspectionFailures: number;
   noCounterpartOrphans: number;
   bytesAtRisk: number;
+  orphanQuarantineMarkers: number;
+  orphanQuarantineMarkerBytes: number;
   totalBytesReclaimed: number;
   entries: RunHomeEntry[];
+  orphanQuarantineMarkerEntries: OrphanQuarantineMarkerEntry[];
 }> {
   if (!Number.isFinite(opts.graceHours) || opts.graceHours < MINIMUM_GRACE_HOURS) {
     throw new Error(`graceHours must be at least ${MINIMUM_GRACE_HOURS}`);
@@ -613,8 +680,11 @@ export async function sweepRunHomes(opts: SweeperOptions, deps: SweeperDependenc
       inspectionFailures: 0,
       noCounterpartOrphans: 0,
       bytesAtRisk: 0,
+      orphanQuarantineMarkers: 0,
+      orphanQuarantineMarkerBytes: 0,
       totalBytesReclaimed: 0,
       entries: [],
+      orphanQuarantineMarkerEntries: [],
     };
   }
 
@@ -632,8 +702,11 @@ export async function sweepRunHomes(opts: SweeperOptions, deps: SweeperDependenc
       inspectionFailures: 0,
       noCounterpartOrphans: 0,
       bytesAtRisk: 0,
+      orphanQuarantineMarkers: 0,
+      orphanQuarantineMarkerBytes: 0,
       totalBytesReclaimed: 0,
       entries: [],
+      orphanQuarantineMarkerEntries: [],
     };
   }
 
@@ -648,24 +721,32 @@ export async function sweepRunHomes(opts: SweeperOptions, deps: SweeperDependenc
       inspectionFailures: 0,
       noCounterpartOrphans: 0,
       bytesAtRisk: 0,
+      orphanQuarantineMarkers: 0,
+      orphanQuarantineMarkerBytes: 0,
       totalBytesReclaimed: 0,
       entries: [],
+      orphanQuarantineMarkerEntries: [],
     };
   }
 
   const agentIds = await fs.readdir(agentsDir).catch(() => [] as string[]);
   const allEntries: RunHomeEntry[] = [];
+  const allOrphanQuarantineMarkerEntries: OrphanQuarantineMarkerEntry[] = [];
 
   for (const agentId of agentIds) {
     const agentDir = path.join(agentsDir, agentId);
-    const agentEntries = await sweepAgentDir(agentDir, agentId, agentsDir, opts, deps);
-    allEntries.push(...agentEntries);
+    const agentResult = await sweepAgentDir(agentDir, agentId, agentsDir, opts, deps);
+    allEntries.push(...agentResult.entries);
+    allOrphanQuarantineMarkerEntries.push(...agentResult.orphanQuarantineMarkerEntries);
   }
 
   const eligible = allEntries.filter((e) => e.eligible);
   const deleted = eligible.filter((e) => e.deleted === true);
   const deletionErrors = eligible.filter((e) => e.deleted === false);
-  const inspectionFailures = allEntries.filter((e) => e.inspectionFailure === true);
+  const inspectionFailures = [
+    ...allEntries.filter((e) => e.inspectionFailure === true),
+    ...allOrphanQuarantineMarkerEntries.filter((entry) => entry.inspectionFailure === true),
+  ];
   const noCounterpartOrphans = allEntries.filter(
     (e) => e.orphanClassification === "terminal_no_retention_counterpart",
   );
@@ -674,6 +755,10 @@ export async function sweepRunHomes(opts: SweeperOptions, deps: SweeperDependenc
     0,
   );
   const totalBytesReclaimed = deleted.reduce((sum, e) => sum + (e.sizeBytes ?? 0), 0);
+  const orphanQuarantineMarkerBytes = allOrphanQuarantineMarkerEntries.reduce(
+    (sum, entry) => sum + entry.markerBytes,
+    0,
+  );
 
   return {
     scanned: allEntries.length,
@@ -683,8 +768,11 @@ export async function sweepRunHomes(opts: SweeperOptions, deps: SweeperDependenc
     inspectionFailures: inspectionFailures.length,
     noCounterpartOrphans: noCounterpartOrphans.length,
     bytesAtRisk,
+    orphanQuarantineMarkers: allOrphanQuarantineMarkerEntries.length,
+    orphanQuarantineMarkerBytes,
     totalBytesReclaimed,
     entries: allEntries,
+    orphanQuarantineMarkerEntries: allOrphanQuarantineMarkerEntries,
   };
 }
 
@@ -715,7 +803,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       process.stdout.write(JSON.stringify(result, null, 2) + "\n");
       const verb = dryRun ? "DRY-RUN" : "DELETED";
       process.stderr.write(
-        `[sweeper] ${verb}: scanned=${result.scanned} eligible=${result.eligible} deleted=${result.deleted} errors=${result.errors} inspectionFailures=${result.inspectionFailures} noCounterpartOrphans=${result.noCounterpartOrphans} bytesAtRisk=${result.bytesAtRisk} reclaimed=${(result.totalBytesReclaimed / 1024 / 1024).toFixed(1)}MB\n`,
+        `[sweeper] ${verb}: scanned=${result.scanned} eligible=${result.eligible} deleted=${result.deleted} errors=${result.errors} inspectionFailures=${result.inspectionFailures} noCounterpartOrphans=${result.noCounterpartOrphans} bytesAtRisk=${result.bytesAtRisk} orphanQuarantineMarkers=${result.orphanQuarantineMarkers} orphanQuarantineMarkerBytes=${result.orphanQuarantineMarkerBytes} reclaimed=${(result.totalBytesReclaimed / 1024 / 1024).toFixed(1)}MB\n`,
       );
     })
     .catch((err) => {
