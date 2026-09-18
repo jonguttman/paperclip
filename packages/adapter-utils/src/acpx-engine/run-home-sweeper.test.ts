@@ -205,12 +205,94 @@ describe("run-home sweeper", () => {
       const entry = result.entries.find((e) => e.runId === "run-quarantined");
       expect(entry).toBeDefined();
       expect(entry!.eligible).toBe(false);
-      expect(entry!.ineligibleReason).toMatch(/quarantined.*no retained session/i);
+      expect(entry!.ineligibleReason).toBe("run home is quarantined by sibling marker file");
+      expect(entry!.quarantined).toBe(true);
+      expect(entry!.orphanClassification).toBeUndefined();
       const stat = await fs.stat(runHomeDir).catch(() => null);
       expect(stat).not.toBeNull();
       await expect(
         fs.stat(path.join(path.dirname(path.dirname(runHomeDir)), "run-quarantined.quarantine")),
       ).resolves.toBeDefined();
+    });
+
+    it("reports a terminal hard-loss orphan as reviewable only after extended age and zero-JSONL proof", async () => {
+      const { runHomeDir } = await buildRunHome({
+        companyDir,
+        agentId: "agent-1",
+        runId: "run-hard-loss",
+        ageHours: 24 * 8,
+      });
+      await fs.rm(path.join(runHomeDir, "sessions"), { recursive: true, force: true });
+      const oldMtime = new Date(Date.now() - 24 * 8 * 60 * 60 * 1000);
+      await fs.utimes(runHomeDir, oldMtime, oldMtime);
+
+      const result = await sweep({ companyDir, dryRun: false, graceHours: 24 });
+      const entry = result.entries.find((candidate) => candidate.runId === "run-hard-loss");
+
+      expect(entry).toMatchObject({
+        eligible: false,
+        orphanClassification: "terminal_no_retention_counterpart",
+        noCounterpartRecovery: {
+          disposition: "operator_approval_required",
+          minimumAgeHours: 168,
+          ageSatisfied: true,
+          terminalOwnershipVerified: true,
+          zeroOpenHandlesVerified: true,
+          rawJsonlCount: 0,
+          zeroRawJsonlVerified: true,
+          reviewCandidate: true,
+          destructiveRecoveryEnabled: false,
+        },
+      });
+      // Even delete mode never deletes a no-counterpart orphan. The manifest is
+      // evidence for a separate operator-approved recovery workflow only.
+      await expect(fs.stat(runHomeDir)).resolves.toBeDefined();
+      expect(result.deleted).toBe(0);
+    });
+
+    it("lets a sibling quarantine marker veto deletion even when exact retained proof exists", async () => {
+      const runId = "run-retained-quarantine";
+      const { runHomeDir } = await buildRunHome({
+        companyDir,
+        agentId: "agent-1",
+        runId,
+        ageHours: 30,
+        withRetained: true,
+        withQuarantine: true,
+      });
+      const marker = path.join(path.dirname(path.dirname(runHomeDir)), `${runId}.quarantine`);
+
+      const result = await sweep({ companyDir, dryRun: false, graceHours: 24 });
+      const entry = result.entries.find((candidate) => candidate.runId === runId);
+
+      expect(entry).toMatchObject({
+        eligible: false,
+        quarantined: true,
+        ineligibleReason: "run home is quarantined by sibling marker file",
+      });
+      await expect(fs.stat(runHomeDir)).resolves.toBeDefined();
+      await expect(fs.stat(marker)).resolves.toBeDefined();
+    });
+
+    it("does not mistake a directory named runId.quarantine for the sibling marker file contract", async () => {
+      const runId = "run-invalid-marker-shape";
+      const { runHomeDir } = await buildRunHome({
+        companyDir,
+        agentId: "agent-1",
+        runId,
+        ageHours: 30,
+        withRetained: true,
+      });
+      await fs.mkdir(path.join(path.dirname(path.dirname(runHomeDir)), `${runId}.quarantine`));
+
+      const result = await sweep({ companyDir, dryRun: false, graceHours: 24 });
+      expect(result.entries[0]).toMatchObject({
+        eligible: false,
+        quarantined: false,
+        quarantineMarkerInvalid: true,
+        ineligibleReason: "quarantine marker path is not a real file",
+      });
+      await expect(fs.stat(runHomeDir)).resolves.toBeDefined();
     });
 
     it("rejects an empty retained-session directory", async () => {

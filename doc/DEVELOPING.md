@@ -1442,8 +1442,14 @@ Local Codex runs use a private home under
 This isolation is unconditional for local Codex ACP executions: two runs never
 share writable `CODEX_HOME` state, including when a restricted runtime policy is
 enforced upstream.
-Paperclip keeps sanitized session JSONL after the runtime closes. It then removes
-the raw run home. Successful retention writes an atomic
+Paperclip keeps **best-effort-redacted** session JSONL after the runtime closes;
+the retained transcript is operational evidence, not a guarantee that every
+unknown credential format was removed. Retention reads each source through an
+8 MiB fixed caller-side bound and caps the source set at 32 MiB per run before
+calling the synchronous diagnostic redactor. Oversize, invalid-UTF-8, or
+unreadable input fails closed: partial retained output is removed and the raw
+home is quarantined. Paperclip removes the raw run home only after bounded
+retention succeeds. Successful retention writes an atomic
 `retention-complete.json` manifest, including for valid zero-session runs. If
 retention or runtime close fails, Paperclip removes partial retained output,
 preserves the home, and writes a sibling `<run-id>.quarantine` marker. If raw-home
@@ -1454,8 +1460,11 @@ marker with reason `raw_run_home_cleanup_failed`, and emits the same visible
 quarantine path also emits an `acpx.codex_run_home.quarantine` runtime event at
 error level. Its version-1 payload includes `runId`, `runHome`,
 `quarantineMarker`, `quarantineMarkerWritten`, and a machine-readable `reason`
-(`sanitized_session_retention_failed`, `raw_run_home_cleanup_failed`, or
-`runtime_close_unconfirmed`). Consumers should alert on the structured event;
+(`sanitized_session_retention_failed`, `raw_run_home_cleanup_failed`,
+`runtime_close_unconfirmed`, `build_runtime_transport_start_failed`, or
+`build_runtime_unused_home_cleanup_failed`). A build failure before transport
+startup removes the provably unused home; cleanup failure or any attempted
+transport startup quarantines it instead. Consumers should alert on the structured event;
 the sibling marker remains the durable filesystem audit record.
 
 The orphan sweeper is dry-run only unless `--delete` is present:
@@ -1474,10 +1483,35 @@ completion manifest. Legacy counterparts must contain a non-empty retained
 artifact for every JSONL file still present in the raw home. Partial, empty,
 unreadable, or symlinked company/ACPX/agent/run-home/retention/session paths
 fail closed. A quarantine
-marker records an incident. It does not permit deletion of the only raw copy.
+marker records an incident. The producer contract is a sibling
+`<run-id>.quarantine` file; that file vetoes sweeper deletion before retention
+or orphan eligibility is evaluated. A directory with the same suffix is not a
+valid marker and also fails closed. Quarantine never permits deletion of the
+only raw copy.
+Terminal homes with no retained counterpart are explicitly classified as
+`terminal_no_retention_counterpart` in the manifest. They remain ineligible in
+both dry-run and `--delete` modes. The manifest separately reports whether a
+future operator-reviewed recovery could satisfy the stricter minimum age (at
+least seven days and at least twice the normal grace), terminal ownership, zero
+open handles, and zero raw JSONL requirements. This report never authorizes or
+performs no-counterpart deletion.
 
 Review the JSON manifest before you add `--delete`. Keep the default 24-hour
 grace period unless the operator has approved a different recovery window.
+
+Retained transcripts have their own bounded lifecycle: 30 days, at most 1,000
+runs, and at most 1 GiB per agent by default. Audit the proposed removals with:
+
+```sh
+npx tsx packages/adapter-utils/src/acpx-engine/session-retention-sweeper.ts \
+  --company-dir /path/to/companies/<company-id>
+```
+
+The retention sweeper preserves a retained counterpart while any raw home for
+the run remains. Once the raw home is absent, approved cleanup removes a stale
+sibling quarantine marker with the retained run. Destructive cleanup is not
+scheduled. A one-off operator-reviewed invocation must supply both `--delete`
+and `--operator-approved`; `--delete` alone fails closed.
 
 ### GitHub identity for shared agents
 

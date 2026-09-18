@@ -50,6 +50,20 @@ interface RunHomeEntry {
   eligible: boolean;
   retentionProof?: "completion_manifest" | "legacy_nonempty_jsonl";
   quarantined?: boolean;
+  quarantineMarkerInvalid?: boolean;
+  orphanClassification?: "terminal_no_retention_counterpart";
+  noCounterpartRecovery?: {
+    disposition: "operator_approval_required";
+    minimumAgeHours: number;
+    ageSatisfied: boolean;
+    terminalOwnershipVerified: true;
+    zeroOpenHandlesVerified: true;
+    rawJsonlCount?: number;
+    zeroRawJsonlVerified: boolean;
+    reviewCandidate: boolean;
+    destructiveRecoveryEnabled: false;
+    inspectionError?: string;
+  };
   ineligibleReason?: string;
   deleted?: boolean;
   error?: string;
@@ -57,6 +71,7 @@ interface RunHomeEntry {
 
 const RETENTION_MANIFEST_NAME = "retention-complete.json";
 const MINIMUM_GRACE_HOURS = 24;
+const MINIMUM_NO_COUNTERPART_RECOVERY_HOURS = 24 * 7;
 
 type RetentionProofCheck =
   | { ok: true; proof: "completion_manifest" | "legacy_nonempty_jsonl" }
@@ -79,10 +94,6 @@ interface SweeperDependencies {
     expectedCompanyId: string,
     expectedAgentId: string,
   ) => Promise<RunStatusCheck>;
-}
-
-async function pathExists(p: string): Promise<boolean> {
-  return fs.access(p).then(() => true, () => false);
 }
 
 function isPathBelow(root: string, candidate: string): boolean {
@@ -280,6 +291,22 @@ async function validateRetentionProof(
   }
 }
 
+async function inspectRawJsonlSet(runHomeDir: string): Promise<
+  { ok: true; count: number } | { ok: false; error: string }
+> {
+  const sessionsDir = path.join(runHomeDir, "sessions");
+  try {
+    const stat = await fs.lstat(sessionsDir);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      return { ok: false, error: "raw sessions path is not a real directory" };
+    }
+    return { ok: true, count: (await listJsonlArtifacts(sessionsDir)).size };
+  } catch (err) {
+    if (isErrnoException(err, "ENOENT")) return { ok: true, count: 0 };
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 function isErrnoException(err: unknown, code: string): err is NodeJS.ErrnoException {
   return err instanceof Error && "code" in err && err.code === code;
 }
@@ -449,17 +476,55 @@ async function sweepAgentDir(
       continue;
     }
 
-    // A retained session counterpart is mandatory. Quarantine is evidence that
-    // retention failed, so it must never substitute for a sanitized copy.
+    // A sibling FILE is the producer's durable quarantine contract. It vetoes
+    // deletion before retained-session or terminal-orphan eligibility is
+    // evaluated. A directory/symlink with this name is not the emitted shape;
+    // treat it as an invalid marker path and fail closed as well.
     const quarantineMarker = path.join(runHomesParent, `${runId}.quarantine`);
-    const hasQuarantine = await pathExists(quarantineMarker);
+    const quarantineMarkerStat = await fs.lstat(quarantineMarker).catch(() => null);
+    const hasQuarantine = quarantineMarkerStat?.isFile() === true && !quarantineMarkerStat.isSymbolicLink();
     entry.quarantined = hasQuarantine;
+    entry.quarantineMarkerInvalid = quarantineMarkerStat !== null && !hasQuarantine;
+    if (hasQuarantine) {
+      entry.ineligibleReason = "run home is quarantined by sibling marker file";
+      entries.push(entry);
+      continue;
+    }
+    if (entry.quarantineMarkerInvalid) {
+      entry.ineligibleReason = "quarantine marker path is not a real file";
+      entries.push(entry);
+      continue;
+    }
+
+    // A retained session counterpart is mandatory. Unmarked no-counterpart
+    // homes are reported for a separate operator-reviewed recovery decision,
+    // but remain ineligible in both dry-run and delete modes.
     const retentionProof = await validateRetentionProof(retentionParent, runId, runHomeDir);
 
     if (!retentionProof.ok) {
-      entry.ineligibleReason = hasQuarantine
-        ? `run home is quarantined; ${retentionProof.error}`
-        : retentionProof.error;
+      if (retentionProof.error === "no retained session counterpart") {
+        const rawJsonl = await inspectRawJsonlSet(runHomeDir);
+        const minimumAgeHours = Math.max(
+          MINIMUM_NO_COUNTERPART_RECOVERY_HOURS,
+          opts.graceHours * 2,
+        );
+        const ageSatisfied = ageSecs >= minimumAgeHours * 60 * 60;
+        const zeroRawJsonlVerified = rawJsonl.ok && rawJsonl.count === 0;
+        entry.orphanClassification = "terminal_no_retention_counterpart";
+        entry.noCounterpartRecovery = {
+          disposition: "operator_approval_required",
+          minimumAgeHours,
+          ageSatisfied,
+          terminalOwnershipVerified: true,
+          zeroOpenHandlesVerified: true,
+          ...(rawJsonl.ok ? { rawJsonlCount: rawJsonl.count } : {}),
+          zeroRawJsonlVerified,
+          reviewCandidate: ageSatisfied && zeroRawJsonlVerified,
+          destructiveRecoveryEnabled: false,
+          ...(!rawJsonl.ok ? { inspectionError: rawJsonl.error } : {}),
+        };
+      }
+      entry.ineligibleReason = retentionProof.error;
       entries.push(entry);
       continue;
     }
