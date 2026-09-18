@@ -45,7 +45,7 @@ const COMMAND_PAPERCLIP_TOKEN_RE = /\bpcp_[a-z][a-z0-9_]*_[0-9a-f]{24,}\b/gi;
 // app-level (xapp).
 const COMMAND_SLACK_TOKEN_RE = /\b(?:xox[abprs]|xapp)-[A-Za-z0-9-]{10,}\b/g;
 const COMMAND_JWT_CANDIDATE_RE =
-  /\beyJ[A-Za-z0-9_-]{5,}(?:\.[A-Za-z0-9_-]{8,}){2,4}\b/g;
+  /\b[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,}){2,}\b/g;
 const COMMAND_SECRET_HINTS = [
   "api",
   "key",
@@ -116,6 +116,21 @@ function hasJwtAlgorithmHeader(candidate: string): boolean {
   }
 }
 
+function redactJwtCandidate(candidate: string, redactedValue: string): string {
+  const segments = candidate.split(".");
+  const headerIndex = segments.findIndex((segment) => hasJwtAlgorithmHeader(segment));
+  const remainingSegments = segments.length - headerIndex;
+  if (headerIndex < 0 || remainingSegments < 3) return candidate;
+
+  // A compact JWS has three segments and a compact JWE has five. Redact at
+  // most five segments from the validated header, preserving any dotted
+  // identifier prefix or suffix that the broad candidate matcher included.
+  const tokenSegmentCount = Math.min(5, remainingSegments);
+  const prefix = segments.slice(0, headerIndex);
+  const suffix = segments.slice(headerIndex + tokenSegmentCount);
+  return [...prefix, redactedValue, ...suffix].join(".");
+}
+
 export function redactCommandText(
   command: string,
   redactedValue = REDACTED_COMMAND_TEXT_VALUE,
@@ -151,7 +166,7 @@ export function redactCommandText(
     .replace(COMMAND_PRIVATE_KEY_BLOCK_RE, redactedValue)
     .replace(
       COMMAND_JWT_CANDIDATE_RE,
-      (candidate) => hasJwtAlgorithmHeader(candidate) ? redactedValue : candidate,
+      (candidate) => redactJwtCandidate(candidate, redactedValue),
     );
 }
 

@@ -111,6 +111,10 @@ second-line\" status=401`;
     expect(redactDiagnosticText(`namespace.${jwt}`)).toBe(
       `namespace.${REDACTED_COMMAND_TEXT_VALUE}`,
     );
+
+    const whitespaceHeader = Buffer.from(' {"alg":"HS256","typ":"JWT"}').toString("base64url");
+    const whitespaceJwt = `${whitespaceHeader}.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlMTIz`;
+    expect(redactDiagnosticText(whitespaceJwt)).toBe(REDACTED_COMMAND_TEXT_VALUE);
   });
 
   it("redacts standard cloud, datastore, private-key, and Stripe credential forms", () => {
