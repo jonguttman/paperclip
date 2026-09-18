@@ -6,6 +6,8 @@ import type {
 } from "@/pages/apps/composio-services";
 import type {
   ToolApplication,
+  ConfigureRailwaySsh,
+  RailwaySshSetup,
   ToolConnection,
   ToolConnectionInstall,
   ToolConnectionInstallSnapshot,
@@ -405,6 +407,8 @@ export const toolsApi = {
     api.post<ToolConnection>(`/companies/${companyId}/tools/connections`, input),
   updateConnection: (connectionId: string, input: UpdateToolConnectionInput) =>
     api.patch<ToolConnection>(`/tool-connections/${connectionId}`, input),
+  configureRailwaySsh: (connectionId: string, input: ConfigureRailwaySsh) =>
+    api.post<RailwaySshSetup | null>(`/tool-connections/${connectionId}/railway/ssh`, input),
   // Removal is a credential-revoking teardown (PAP-17119), so the response
   // carries the cleanup receipt alongside the archived connection.
   archiveConnection: (connectionId: string, options: { confirmComposioChildren?: boolean } = {}) =>
@@ -550,10 +554,10 @@ export const toolsApi = {
     api.get<ToolActionRequestsResponse>(
       `/companies/${companyId}/tools/action-requests?status=${encodeURIComponent(status)}`,
     ),
-  approveActionRequest: (companyId: string, actionRequestId: string) =>
-    api.post<ToolActionRequest>(`/tool-gateway/action-requests/${actionRequestId}/approve`, { companyId }),
-  declineActionRequest: (companyId: string, actionRequestId: string) =>
-    api.post<ToolActionRequest>(`/tool-gateway/action-requests/${actionRequestId}/decline`, { companyId }),
+  approveActionRequest: (companyId: string, actionRequestId: string, rememberAction = false) =>
+    api.post<ToolActionRequest>(`/tool-gateway/action-requests/${actionRequestId}/approve`, { companyId, rememberAction }),
+  declineActionRequest: (companyId: string, actionRequestId: string, reason?: string) =>
+    api.post<ToolActionRequest>(`/tool-gateway/action-requests/${actionRequestId}/decline`, { companyId, reason }),
   createTrustRuleFromActionRequest: (
     companyId: string,
     actionRequestId: string,
