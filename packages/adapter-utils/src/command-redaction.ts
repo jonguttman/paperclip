@@ -30,7 +30,7 @@ const COMMAND_AWS_SECRET_ACCESS_KEY_RE = new RegExp(
 // the documented 40-character base64 shape with mixed case and a '/' or '+';
 // context-labelled values remain covered even when they are entirely alphanumeric.
 const COMMAND_AWS_SECRET_ACCESS_KEY_SHAPE_RE =
-  /(?<![A-Za-z0-9/+=])(?=[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=]))(?=[A-Za-z0-9/+=]{0,39}[+/])(?=[A-Za-z0-9/+=]{0,39}[a-z])(?=[A-Za-z0-9/+=]{0,39}[A-Z])[A-Za-z0-9/+=]{40}/g;
+  /(?<![A-Za-z0-9/+])(?=[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=]))(?=[A-Za-z0-9/+=]{0,39}[+/])(?=[A-Za-z0-9/+=]{0,39}[a-z])(?=[A-Za-z0-9/+=]{0,39}[A-Z])[A-Za-z0-9/+=]{40}/g;
 const COMMAND_INLINE_DSN_PASSWORD_RE =
   /(\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqp|amqps):\/\/[^:\s/@]+:)[^@\s]+(@)/gi;
 const COMMAND_PRIVATE_KEY_BLOCK_RE =
@@ -45,7 +45,7 @@ const COMMAND_PAPERCLIP_TOKEN_RE = /\bpcp_[a-z][a-z0-9_]*_[0-9a-f]{24,}\b/gi;
 // app-level (xapp).
 const COMMAND_SLACK_TOKEN_RE = /\b(?:xox[abprs]|xapp)-[A-Za-z0-9-]{10,}\b/g;
 const COMMAND_JWT_CANDIDATE_RE =
-  /\b[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,}){2,4}\b/g;
+  /\beyJ[A-Za-z0-9_-]{5,}(?:\.[A-Za-z0-9_-]{8,}){2,4}\b/g;
 const COMMAND_SECRET_HINTS = [
   "api",
   "key",

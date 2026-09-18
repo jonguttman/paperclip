@@ -108,6 +108,9 @@ second-line\" status=401`;
   it("redacts a compact JWT only when its header decodes to an algorithm object", () => {
     const jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlMTIz";
     expect(redactDiagnosticText(jwt)).toBe(REDACTED_COMMAND_TEXT_VALUE);
+    expect(redactDiagnosticText(`namespace.${jwt}`)).toBe(
+      `namespace.${REDACTED_COMMAND_TEXT_VALUE}`,
+    );
   });
 
   it("redacts standard cloud, datastore, private-key, and Stripe credential forms", () => {
@@ -134,6 +137,13 @@ second-line\" status=401`;
     expect(output).not.toContain(stripeKey);
     expect(output).not.toContain("Sup3rS3cret");
     expect(output).not.toContain("ZmFrZS1rZXktbWF0ZXJpYWw=");
+  });
+
+  it("redacts an AWS secret-key shape immediately after an assignment", () => {
+    const awsSecretKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    const output = redactDiagnosticText(`export MY_KEY=${awsSecretKey}`);
+
+    expect(output).toBe(`export MY_KEY=${REDACTED_COMMAND_TEXT_VALUE}`);
   });
 
   it("reports the number of introduced redaction markers", () => {
